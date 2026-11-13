@@ -1,0 +1,992 @@
+diff --git a/.dockerignore b/.dockerignore
+index a22251e..4a3695e 100644
+--- a/.dockerignore
++++ b/.dockerignore
+@@ -6,6 +6,15 @@ build/
+ build-*/
+ cmake-build-*/
+ data/
++rootfs/data/
++.env
++.env.*
++!.env.example
++.app.lock
++target/
++build.log
++*.log
++malloc-conf-disassembly.txt
+ 
+ *.apk
+ *.apkm
+diff --git a/CMakeLists.txt b/CMakeLists.txt
+index 1bb3ad4..407379c 100644
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -34,6 +34,7 @@ set(TARGET_ARCH "x86_64" CACHE STRING "Target ABI for the chrooted daemon (match
+ set_property(CACHE TARGET_ARCH PROPERTY STRINGS "x86_64" "arm64-v8a")
+ 
+ option(WRAPPER_BUILD_DAEMON "Drive the NDK sub-build for the chrooted daemon" ON)
++option(WRAPPER_PAGE_COMPAT "Guard Android madvise for large-page QEMU hosts" OFF)
+ 
+ # -----------------------------------------------------------------------------
+ # Locate the NDK (only required when WRAPPER_BUILD_DAEMON is ON)
+@@ -106,6 +107,7 @@ if(WRAPPER_BUILD_DAEMON)
+             -DANDROID_PLATFORM=android-21
+             -DANDROID_STL=c++_shared
+             -DCMAKE_BUILD_TYPE=$<IF:$<CONFIG:Debug>,Debug,Release>
++            -DWRAPPER_PAGE_COMPAT=${WRAPPER_PAGE_COMPAT}
+             -DLIBS_DIR=${CMAKE_SOURCE_DIR}/rootfs/system/lib64
+         COMMAND ${CMAKE_COMMAND} --build "${_daemon_build}" -j
+         COMMAND ${CMAKE_COMMAND} -E make_directory "${CMAKE_SOURCE_DIR}/rootfs/system/bin"
+diff --git a/Dockerfile b/Dockerfile
+index 8ee665e..cb9a044 100644
+--- a/Dockerfile
++++ b/Dockerfile
+@@ -4,28 +4,32 @@
+ # by the host (or in CI) for the same TARGET_ARCH. The image does not download
+ # or extract Apple Music artifacts.
+ #
+-# The build stage is always linux/amd64: Google only publishes the Linux NDK as
+-# an x86_64-host zip (android-ndk-r*b-linux.zip). On TARGET_ARCH=arm64-v8a we
+-# cross-compile the host `wrapper` with gcc-aarch64-linux-gnu; the daemon is
+-# still built with the NDK for ANDROID_ABI=arm64-v8a.
++# The Android worker build stage is always linux/amd64: Google only publishes
++# the Linux NDK as an x86_64-host zip (android-ndk-r*b-linux.zip). The Rust
++# supervisor is built separately for RUNTIME_PLATFORM, because its CPU is not
++# necessarily the Android worker ABI (the large-page ARM profile is mixed).
+ #
+-# Final image platform (e.g. linux/arm64 vs linux/amd64) comes from
+-# RUNTIME_PLATFORM and must match TARGET_ARCH / the staged rootfs.
++# Final image platform comes from RUNTIME_PLATFORM. WORKER_MODE=native requires
++# it to match TARGET_ARCH. WORKER_MODE=qemu_x86_64 packages the tested x86_64
++# worker emulator for an ARM64 runtime.
+ #
+ # Example:
+ #   docker build --build-arg TARGET_ARCH=arm64-v8a \
+ #     --build-arg RUNTIME_PLATFORM=linux/arm64 -t wrapper-v2:arm64 .
+ 
+ ARG RUNTIME_PLATFORM=linux/amd64
++ARG WORKER_MODE=native
+ # Kept for docker-compose compatibility; the compile stage ignores this.
+ ARG BUILD_PLATFORM=linux/amd64
+ 
+ # -----------------------------------------------------------------------------
+-# Build stage (always amd64 — official NDK is x86_64-hosted)
++# Worker build stage (always amd64 — official NDK is x86_64-hosted)
+ # -----------------------------------------------------------------------------
+ FROM --platform=linux/amd64 debian:13.2 AS build
+ 
+ ARG TARGET_ARCH=x86_64
++ARG WORKER_MODE
++ARG RUNTIME_PLATFORM
+ ARG CMAKE_BUILD_TYPE=Release
+ ARG NDK_VERSION=23
+ SHELL ["/bin/bash", "-c"]
+@@ -55,14 +59,14 @@ RUN curl -fSL -o /tmp/ndk.zip \
+     rm /tmp/ndk.zip
+ ENV ANDROID_NDK_HOME=/opt/android-ndk-r${NDK_VERSION}b
+ 
+-ENV CARGO_HOME=/usr/local/cargo \
+-    RUSTUP_HOME=/usr/local/rustup \
+-    PATH=/usr/local/cargo/bin:${PATH}
+-RUN curl -fsSL https://sh.rustup.rs | sh -s -- -y --profile minimal --default-toolchain stable
+-
+ WORKDIR /app
+ COPY . /app
+ 
++RUN case "${WORKER_MODE}:${TARGET_ARCH}:${RUNTIME_PLATFORM}" in \
++      native:x86_64:linux/amd64|native:arm64-v8a:linux/arm64|qemu_x86_64:x86_64:linux/arm64) ;; \
++      *) echo "Unsupported worker/runtime profile: ${WORKER_MODE}/${TARGET_ARCH}/${RUNTIME_PLATFORM}" >&2; exit 1 ;; \
++    esac
++
+ RUN test -f rootfs/system/bin/linker64 || { \
+         echo "ERROR: rootfs/system/bin/linker64 is missing." >&2; \
+         echo "Run tools/stage-system.sh on the host before docker build." >&2; \
+@@ -76,38 +80,41 @@ RUN test -f rootfs/system/bin/linker64 || { \
+     }
+ 
+ RUN host_cc=(); \
++    page_compat=OFF; \
+     if [[ "$TARGET_ARCH" == "arm64-v8a" ]]; then \
+       host_cc=( \
+         -DCMAKE_C_COMPILER=aarch64-linux-gnu-gcc \
+         -DCMAKE_CXX_COMPILER=aarch64-linux-gnu-g++ \
+       ); \
+     fi && \
++    if [[ "$WORKER_MODE" == "qemu_x86_64" ]]; then page_compat=ON; fi && \
+     cmake -S . -B build -G Ninja \
+         -DTARGET_ARCH="${TARGET_ARCH}" \
++        -DWRAPPER_PAGE_COMPAT="${page_compat}" \
+         "${host_cc[@]}" \
+         -DCMAKE_BUILD_TYPE="${CMAKE_BUILD_TYPE}" && \
+     cmake --build build -j
+ 
+-RUN if [[ "$TARGET_ARCH" == "arm64-v8a" ]]; then \
+-      rustup target add aarch64-unknown-linux-gnu && \
+-      mkdir -p .cargo && \
+-      printf '[target.aarch64-unknown-linux-gnu]\nlinker = "aarch64-linux-gnu-gcc"\n' > .cargo/config.toml && \
+-      cargo build --release --target aarch64-unknown-linux-gnu && \
+-      cp target/aarch64-unknown-linux-gnu/release/wrapperd /app/wrapperd; \
+-    else \
+-      cargo build --release && \
+-      cp target/release/wrapperd /app/wrapperd; \
+-    fi
++# Build the supervisor on the runtime CPU. This avoids running an amd64 Rust
++# compiler under QEMU on ARM and keeps its glibc baseline independent of the
++# worker ABI.
++FROM --platform=${RUNTIME_PLATFORM} rust:1.85.1-slim-bookworm AS supervisor_build
++WORKDIR /app
++COPY Cargo.toml Cargo.lock /app/
++COPY src/rust /app/src/rust
++RUN cargo build --release --locked && cp target/release/wrapperd /app/wrapperd
+ 
+ # -----------------------------------------------------------------------------
+-# Runtime stage
++# Runtime stages
+ # -----------------------------------------------------------------------------
+-FROM --platform=${RUNTIME_PLATFORM} debian:13.2
++FROM --platform=linux/amd64 debian:13.2 AS x86_runtime
++FROM --platform=linux/arm64 tonistiigi/binfmt@sha256:400a4873b838d1b89194d982c45e5fb3cda4593fbfd7e08a02e76b03b21166f0 AS emulator
++
++FROM --platform=${RUNTIME_PLATFORM} debian:13.2 AS runtime_base
+ 
+ WORKDIR /app
+ 
+-COPY --from=build /app/wrapper        /app/wrapper
+-COPY --from=build /app/wrapperd       /app/wrapperd
++COPY --from=supervisor_build /app/wrapperd /app/wrapperd
+ COPY --from=build /app/rootfs         /app/rootfs
+ 
+ # Apple's libcurl inside the chroot needs CA certificates for SSL verification.
+@@ -118,3 +125,25 @@ COPY --from=build /etc/ssl/certs/ca-certificates.crt /app/rootfs/etc/ssl/certs/c
+ EXPOSE 80 10020
+ 
+ ENTRYPOINT ["/app/wrapperd"]
++
++FROM runtime_base AS native
++COPY --from=build /app/wrapper /app/wrapper
++
++FROM runtime_base AS qemu_x86_64
++COPY --from=build /app/wrapper /app/wrapper-x86
++COPY --from=build /app/tools/start-worker.sh /app/wrapper
++COPY --from=emulator /usr/bin/qemu-x86_64 /usr/local/bin/qemu-x86_64-static
++COPY --from=emulator /usr/bin/qemu-x86_64 /app/rootfs/system/bin/qemu-x86_64-static
++
++# The ARM supervisor starts an x86_64 Linux launcher before it enters the
++# Android chroot. Supply that launcher's glibc interpreter and libc.
++COPY --from=x86_runtime /usr/lib/x86_64-linux-gnu/ld-linux-x86-64.so.2 /usr/lib/x86_64-linux-gnu/ld-linux-x86-64.so.2
++COPY --from=x86_runtime /usr/lib/x86_64-linux-gnu/libc.so.6 /usr/lib/x86_64-linux-gnu/libc.so.6
++RUN chmod 755 /app/wrapper && \
++    mkdir -p /lib64 && \
++    ln -s /usr/lib/x86_64-linux-gnu/ld-linux-x86-64.so.2 /lib64/ld-linux-x86-64.so.2
++
++# Select exactly one final stage. Native images do not contain QEMU or x86
++# runtime files; the compatibility image retains the validated Asahi path.
++ARG WORKER_MODE
++FROM ${WORKER_MODE} AS final
+diff --git a/compose.yaml b/compose.yaml
+index e990a5b..ff7eb09 100644
+--- a/compose.yaml
++++ b/compose.yaml
+@@ -7,9 +7,11 @@ services:
+         TARGET_ARCH: ${TARGET_ARCH:-x86_64}
+         BUILD_PLATFORM: ${BUILD_PLATFORM:-linux/amd64}
+         RUNTIME_PLATFORM: ${RUNTIME_PLATFORM:-linux/amd64}
+-    image: wrapper-v2:latest
+-    container_name: wrapper-v2
+-    restart: unless-stopped
++        WORKER_MODE: ${WRAPPER_WORKER_MODE:-native}
++    image: wrapper-v2:${WRAPPER_IMAGE_TAG:-native-amd64}
++    platform: ${RUNTIME_PLATFORM:-linux/amd64}
++    restart: "no"
++    stop_grace_period: 2s
+     cap_add:
+       - SYS_ADMIN
+       - SYS_CHROOT
+@@ -17,8 +19,8 @@ services:
+     security_opt:
+       - apparmor:unconfined
+     ports:
+-      - "${HTTP_PORT:-80}:80"
+-      - "${DECRYPT_PORT:-10020}:10020"
++      - "127.0.0.1:${HTTP_PORT:-8080}:80"
++      - "127.0.0.1:${DECRYPT_PORT:-10020}:10020"
+     environment:
+       WRAPPER_HOST: ${WRAPPER_HOST:-}
+       WRAPPER_PORT: ${WRAPPER_PORT:-}
+@@ -34,6 +36,9 @@ services:
+       WRAPPER_PASSWORD: ${WRAPPER_PASSWORD:-}
+       WRAPPER_APPLE_INIT: ${WRAPPER_APPLE_INIT:-}
+       WRAPPER_RUNTIME_TRACE: ${WRAPPER_RUNTIME_TRACE:-}
++      # Zero disables the large-host-page guard. The app/setup script supplies
++      # the actual Linux kernel page size only for the emulated ARM profile.
++      WRAPPER_HOST_PAGE_SIZE: ${WRAPPER_HOST_PAGE_SIZE:-0}
+     volumes:
+       # Persist Apple state at the same path shape as the Android app sandbox.
+-      - ./data:/app/rootfs/data/data/com.apple.android.music/files
++      - "${WRAPPER_DATA_DIR:-./data}:/app/rootfs/data/data/com.apple.android.music/files"
+diff --git a/src/daemon/CMakeLists.txt b/src/daemon/CMakeLists.txt
+index a96ec0f..e4a372b 100644
+--- a/src/daemon/CMakeLists.txt
++++ b/src/daemon/CMakeLists.txt
+@@ -38,6 +38,10 @@ add_executable(main
+     apple/tokens.cpp
+ )
+ 
++if(WRAPPER_PAGE_COMPAT)
++    target_sources(main PRIVATE page_compat.cpp)
++endif()
++
+ target_include_directories(main PRIVATE
+     ${CMAKE_CURRENT_SOURCE_DIR}
+ )
+@@ -62,6 +66,9 @@ target_compile_options(main PRIVATE
+ target_link_options(main PRIVATE
+     -Wl,--hash-style=both
+ )
++if(WRAPPER_PAGE_COMPAT)
++    target_link_options(main PRIVATE -Wl,--export-dynamic-symbol=madvise)
++endif()
+ 
+ # -----------------------------------------------------------------------------
+ # Apple native libraries
+diff --git a/src/daemon/apple/loader.cpp b/src/daemon/apple/loader.cpp
+index 965dda5..e483d58 100644
+--- a/src/daemon/apple/loader.cpp
++++ b/src/daemon/apple/loader.cpp
+@@ -150,6 +150,19 @@ bool Loader::open(const std::string& libs_dir) {
+     }
+     trace("all core libs loaded; starting symbol resolution");
+ 
++    if (loader_trace_enabled()) {
++        for (const char* name : {"malloc", "_Znwm", abi::mangled::RequestContext_init,
++                                 abi::mangled::API_handleProtocolDialogResponse,
++                                 abi::mangled::FootHillConfig_config}) {
++            Dl_info info{};
++            void* addr = dlsym(RTLD_DEFAULT, name);
++            if (addr && dladdr(addr, &info)) {
++                std::fprintf(stderr, "loader: mapping %s base=%p symbol=%p\n",
++                             info.dli_fname, info.dli_fbase, addr);
++            }
++        }
++    }
++
+     using namespace abi;
+ 
+     if (!resolve(RTLD_DEFAULT,
+@@ -363,14 +376,14 @@ bool Loader::open(const std::string& libs_dir) {
+         abi::fn_SVFootHillSessionCtrl_getPersistentKey  pk8 = nullptr;
+         abi::fn_SVFootHillSessionCtrl_getPersistentKey7 pk7 = nullptr;
+         bool                                              pk  = false;
+-        if (resolve_fps(mangled::SVFootHillSessionCtrl_getPersistentKey_8str, &pk8)) {
+-            foot_hill_persistent_key_fn_   = reinterpret_cast<void*>(pk8);
+-            foot_hill_persistent_key_abi8_ = true;
+-            pk                             = true;
+-        } else if (resolve_fps(mangled::SVFootHillSessionCtrl_getPersistentKey_7str, &pk7)) {
++        if (resolve_fps(mangled::SVFootHillSessionCtrl_getPersistentKey_7str, &pk7)) {
+             foot_hill_persistent_key_fn_   = reinterpret_cast<void*>(pk7);
+             foot_hill_persistent_key_abi8_ = false;
+             pk                             = true;
++        } else if (resolve_fps(mangled::SVFootHillSessionCtrl_getPersistentKey_8str, &pk8)) {
++            foot_hill_persistent_key_fn_   = reinterpret_cast<void*>(pk8);
++            foot_hill_persistent_key_abi8_ = true;
++            pk                             = true;
+         }
+         fps_ok &= pk;
+     }
+diff --git a/src/daemon/page_compat.cpp b/src/daemon/page_compat.cpp
+new file mode 100644
+index 0000000..4ce7c68
+--- /dev/null
++++ b/src/daemon/page_compat.cpp
+@@ -0,0 +1,27 @@
++// QEMU user emulation keeps the Linux host kernel's discard granularity.
++// On a host page larger than Android's 4 KiB page, forwarding a partial-page
++// MADV_DONTNEED can discard neighboring live jemalloc allocations. The guard
++// is disabled for native profiles by setting WRAPPER_HOST_PAGE_SIZE to 0.
++#include <cerrno>
++#include <cstddef>
++#include <cstdint>
++#include <cstdlib>
++#include <sys/mman.h>
++#include <sys/syscall.h>
++#include <unistd.h>
++
++extern "C" int madvise(void* address, std::size_t length, int advice) {
++    const char* value = std::getenv("WRAPPER_HOST_PAGE_SIZE");
++    char* end = nullptr;
++    errno = 0;
++    const unsigned long host_page = value ? std::strtoul(value, &end, 10) : 0;
++    const bool valid = value && end && *value && *end == '\0' && errno == 0 &&
++                       host_page > 4096 && (host_page & (host_page - 1)) == 0;
++    if (valid && advice == MADV_DONTNEED &&
++        ((reinterpret_cast<std::uintptr_t>(address) & (host_page - 1)) ||
++         (length & (host_page - 1)))) {
++        errno = EINVAL;
++        return -1;
++    }
++    return static_cast<int>(syscall(SYS_madvise, address, length, advice));
++}
+diff --git a/src/launcher/wrapper.c b/src/launcher/wrapper.c
+index cbdacc7..e98e530 100644
+--- a/src/launcher/wrapper.c
++++ b/src/launcher/wrapper.c
+@@ -203,7 +203,17 @@ int main(int argc, char* argv[], char* envp[]) {
+     /* argv list must be NULL-terminated (C null pointer, not C++ nullptr). */
+     fixed_argv[argc > 0 ? argc : 1] = 0;
+ 
+-    execve(DAEMON_PATH, fixed_argv, environ);
+-    fprintf(stderr, "wrapper: execve %s: %s\n", DAEMON_PATH, strerror(errno));
++    const char* emulator = getenv("WRAPPER_QEMU_PATH");
++    if (emulator && *emulator) {
++        char* emulator_argv[max_args + 2];
++        emulator_argv[0] = (char*)emulator;
++        const int last_argv = argc > 0 ? argc : 1;
++        for (int i = 0; i <= last_argv; ++i) emulator_argv[i + 1] = fixed_argv[i];
++        execve(emulator, emulator_argv, environ);
++    } else {
++        execve(DAEMON_PATH, fixed_argv, environ);
++    }
++    fprintf(stderr, "wrapper: execve %s: %s\n",
++            emulator && *emulator ? emulator : DAEMON_PATH, strerror(errno));
+     return 1;
+ }
+diff --git a/src/rust/main.rs b/src/rust/main.rs
+index 8d9e6c9..5ea054d 100644
+--- a/src/rust/main.rs
++++ b/src/rust/main.rs
+@@ -5,6 +5,7 @@ use std::collections::HashMap;
+ use std::env;
+ use std::io::{self, BufRead, BufReader, Read, Write};
+ use std::net::{Shutdown, TcpListener, TcpStream};
++use std::sync::atomic::{AtomicBool, Ordering};
+ use std::sync::Arc;
+ use std::thread;
+ use std::time::Duration;
+@@ -17,6 +18,11 @@ const DEFAULT_HTTP_HOST: &str = "0.0.0.0";
+ const DEFAULT_HTTP_PORT: u16 = 80;
+ const DEFAULT_DECRYPT_HOST: &str = "0.0.0.0";
+ const DEFAULT_DECRYPT_PORT: u16 = 10020;
++static SHUTTING_DOWN: AtomicBool = AtomicBool::new(false);
++
++extern "C" fn shutdown_signal(_signal: libc::c_int) {
++    SHUTTING_DOWN.store(true, Ordering::Relaxed);
++}
+ 
+ fn main() {
+     if let Err(e) = run() {
+@@ -26,6 +32,7 @@ fn main() {
+ }
+ 
+ fn run() -> io::Result<()> {
++    install_shutdown_handlers()?;
+     let http_host = env_or("WRAPPER_HOST", DEFAULT_HTTP_HOST);
+     let http_port = env_u16("WRAPPER_PORT", DEFAULT_HTTP_PORT);
+     let decrypt_host = env_or("WRAPPER_DECRYPT_HOST", DEFAULT_DECRYPT_HOST);
+@@ -36,15 +43,40 @@ fn run() -> io::Result<()> {
+ 
+     let tcp_worker = Arc::clone(&worker);
+     let tcp_addr = format!("{decrypt_host}:{decrypt_port}");
+-    thread::spawn(move || {
+-        if let Err(e) = run_decrypt_tcp(&tcp_addr, tcp_worker) {
++    let tcp_thread = thread::spawn(move || {
++        let result = run_decrypt_tcp(&tcp_addr, tcp_worker);
++        if let Err(e) = &result {
+             eprintln!("wrapperd: decrypt tcp listener stopped: {e}");
+-            std::process::exit(1);
++            SHUTTING_DOWN.store(true, Ordering::Relaxed);
+         }
++        result
+     });
+ 
+     let http_addr = format!("{http_host}:{http_port}");
+-    run_http(&http_addr, worker)
++    let http_result = run_http(&http_addr, Arc::clone(&worker));
++    SHUTTING_DOWN.store(true, Ordering::Relaxed);
++    let tcp_result = tcp_thread
++        .join()
++        .map_err(|_| io::Error::other("decrypt listener thread panicked"));
++    worker.shutdown();
++    http_result?;
++    tcp_result??;
++    Ok(())
++}
++
++fn install_shutdown_handlers() -> io::Result<()> {
++    unsafe {
++        let mut action: libc::sigaction = std::mem::zeroed();
++        action.sa_sigaction = shutdown_signal as *const () as usize;
++        action.sa_flags = 0;
++        libc::sigemptyset(&mut action.sa_mask);
++        for signal in [libc::SIGTERM, libc::SIGINT] {
++            if libc::sigaction(signal, &action, std::ptr::null_mut()) != 0 {
++                return Err(io::Error::last_os_error());
++            }
++        }
++    }
++    Ok(())
+ }
+ 
+ fn env_or(name: &str, fallback: &str) -> String {
+@@ -63,15 +95,16 @@ fn env_u16(name: &str, fallback: u16) -> u16 {
+ }
+ 
+ fn worker_io_error(e: WorkerError) -> io::Error {
+-    io::Error::new(io::ErrorKind::Other, e.to_string())
++    io::Error::other(e.to_string())
+ }
+ 
+ fn run_http(addr: &str, worker: Arc<Worker>) -> io::Result<()> {
+     let listener = TcpListener::bind(addr)?;
++    listener.set_nonblocking(true)?;
+     eprintln!("wrapperd: {VERSION} HTTP listening on {addr}");
+-    for conn in listener.incoming() {
+-        match conn {
+-            Ok(stream) => {
++    while !SHUTTING_DOWN.load(Ordering::Relaxed) {
++        match listener.accept() {
++            Ok((stream, _)) => {
+                 let worker = Arc::clone(&worker);
+                 thread::spawn(move || {
+                     if let Err(e) = handle_http_connection(stream, worker) {
+@@ -79,7 +112,11 @@ fn run_http(addr: &str, worker: Arc<Worker>) -> io::Result<()> {
+                     }
+                 });
+             }
+-            Err(e) => eprintln!("wrapperd: http accept error: {e}"),
++            Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
++                thread::sleep(Duration::from_millis(50));
++            }
++            Err(e) if e.kind() == io::ErrorKind::Interrupted => {}
++            Err(e) => return Err(e),
+         }
+     }
+     Ok(())
+@@ -333,10 +370,11 @@ fn write_response(
+ 
+ fn run_decrypt_tcp(addr: &str, worker: Arc<Worker>) -> io::Result<()> {
+     let listener = TcpListener::bind(addr)?;
++    listener.set_nonblocking(true)?;
+     eprintln!("wrapperd: {VERSION} TCP decrypt listening on {addr}");
+-    for conn in listener.incoming() {
+-        match conn {
+-            Ok(stream) => {
++    while !SHUTTING_DOWN.load(Ordering::Relaxed) {
++        match listener.accept() {
++            Ok((stream, _)) => {
+                 let worker = Arc::clone(&worker);
+                 thread::spawn(move || {
+                     if let Err(e) = handle_decrypt_client(stream, worker) {
+@@ -344,7 +382,11 @@ fn run_decrypt_tcp(addr: &str, worker: Arc<Worker>) -> io::Result<()> {
+                     }
+                 });
+             }
+-            Err(e) => eprintln!("wrapperd: decrypt accept error: {e}"),
++            Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
++                thread::sleep(Duration::from_millis(50));
++            }
++            Err(e) if e.kind() == io::ErrorKind::Interrupted => {}
++            Err(e) => return Err(e),
+         }
+     }
+     Ok(())
+diff --git a/src/rust/worker.rs b/src/rust/worker.rs
+index 015e247..c80b3df 100644
+--- a/src/rust/worker.rs
++++ b/src/rust/worker.rs
+@@ -2,7 +2,7 @@ use std::fmt;
+ use std::io::{self, Read, Write};
+ use std::os::fd::AsRawFd;
+ use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
+-use std::sync::atomic::{AtomicU32, Ordering};
++use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+ use std::sync::{Mutex, MutexGuard, TryLockError};
+ use std::thread;
+ use std::time::{Duration, Instant};
+@@ -50,6 +50,7 @@ pub struct Worker {
+     timeout_count: AtomicU32,
+     waiting_count: AtomicU32,
+     pid: AtomicU32,
++    shutting_down: AtomicBool,
+     proc: Mutex<Option<WorkerProcess>>,
+     state: Mutex<WorkerState>,
+ }
+@@ -87,6 +88,7 @@ impl Worker {
+             timeout_count: AtomicU32::new(0),
+             waiting_count: AtomicU32::new(0),
+             pid: AtomicU32::new(0),
++            shutting_down: AtomicBool::new(false),
+             proc: Mutex::new(None),
+             state: Mutex::new(WorkerState {
+                 current: None,
+@@ -97,10 +99,12 @@ impl Worker {
+     }
+ 
+     pub fn ensure_started(&self) -> Result<(), WorkerError> {
++        self.ensure_running()?;
+         let mut guard = self
+             .proc
+             .lock()
+             .map_err(|_| WorkerError::Unavailable("worker mutex poisoned".to_string()))?;
++        self.ensure_running()?;
+         if let Some(p) = guard.as_mut() {
+             if p.child.try_wait().map_err(io_err)?.is_none() {
+                 return Ok(());
+@@ -111,6 +115,66 @@ impl Worker {
+         Ok(())
+     }
+ 
++    pub fn shutdown(&self) {
++        if self.shutting_down.swap(true, Ordering::Relaxed) {
++            return;
++        }
++
++        eprintln!("wrapperd: stopping ipc worker");
++        let deadline = Instant::now() + Duration::from_millis(800);
++        let mut signaled_pid = 0;
++        let mut forced = false;
++        let proc = loop {
++            let pid = self.pid.load(Ordering::Relaxed);
++            if pid != 0 && pid != signaled_pid {
++                unsafe {
++                    libc::kill(pid as libc::pid_t, libc::SIGTERM);
++                }
++                signaled_pid = pid;
++            }
++            if !forced && Instant::now() >= deadline {
++                if pid != 0 {
++                    unsafe {
++                        libc::kill(pid as libc::pid_t, libc::SIGKILL);
++                    }
++                }
++                forced = true;
++            }
++
++            match self.proc.try_lock() {
++                Ok(mut guard) => {
++                    let proc = guard.take();
++                    if proc.is_some() || self.pid.load(Ordering::Relaxed) == 0 {
++                        break proc;
++                    }
++                }
++                Err(TryLockError::Poisoned(error)) => {
++                    let mut guard = error.into_inner();
++                    let proc = guard.take();
++                    if proc.is_some() || self.pid.load(Ordering::Relaxed) == 0 {
++                        break proc;
++                    }
++                }
++                Err(TryLockError::WouldBlock) => {
++                    thread::sleep(Duration::from_millis(10));
++                }
++            }
++            thread::sleep(Duration::from_millis(10));
++        };
++        stop_worker(proc, "supervisor shutdown");
++        self.pid.store(0, Ordering::Relaxed);
++    }
++
++    fn ensure_running(&self) -> Result<(), WorkerError> {
++        if self.shutting_down.load(Ordering::Relaxed) {
++            Err(WorkerError::Unavailable(
++                "supervisor is shutting down".to_string(),
++            ))
++        } else {
++            Ok(())
++        }
++    }
++
+     pub fn health(&self) -> Result<WorkerResponse, WorkerError> {
+         self.request_json(protocol::OP_HEALTH, Value::Null)
+     }
+@@ -175,6 +239,7 @@ impl Worker {
+     }
+ 
+     fn request(&self, opcode: u16, payload: Vec<u8>) -> Result<protocol::Frame, WorkerError> {
++        self.ensure_running()?;
+         let id = self.next_id.fetch_add(1, Ordering::Relaxed);
+         let deadline = Instant::now() + self.request_timeout;
+         let wait_tracker = self.track_wait();
+@@ -194,6 +259,7 @@ impl Worker {
+             }
+         };
+         drop(wait_tracker);
++        self.ensure_running()?;
+         let _tracker = self.track_request(id, opcode);
+         if guard.is_none() {
+             *guard = Some(self.spawn()?);
+@@ -254,6 +320,7 @@ impl Worker {
+     }
+ 
+     fn spawn(&self) -> Result<WorkerProcess, WorkerError> {
++        self.ensure_running()?;
+         eprintln!("wrapperd: starting ipc worker {}", self.launcher);
+         let mut child = Command::new(&self.launcher)
+             .env("WRAPPER_MODE", "ipc-worker")
+@@ -272,6 +339,12 @@ impl Worker {
+             .ok_or_else(|| WorkerError::Io("worker stdout unavailable".to_string()))?;
+         set_nonblocking(&stdin)?;
+         set_nonblocking(&stdout)?;
++        if self.shutting_down.load(Ordering::Relaxed) {
++            stop_child(&mut child, "shutdown raced worker start");
++            return Err(WorkerError::Unavailable(
++                "supervisor is shutting down".to_string(),
++            ));
++        }
+         self.pid.store(child.id(), Ordering::Relaxed);
+         let _ = &self.version;
+         Ok(WorkerProcess {
+@@ -282,17 +355,21 @@ impl Worker {
+     }
+ 
+     fn restart_after_delay(&self) {
+-        let old = {
+-            let mut guard = match self.proc.lock() {
+-                Ok(g) => g,
+-                Err(_) => return,
+-            };
+-            guard.take()
++        let mut guard = match self.proc.lock() {
++            Ok(g) => g,
++            Err(_) => return,
+         };
+-        self.pid.store(0, Ordering::Relaxed);
+-        cleanup_worker(old, "restart requested by worker response");
++        let old = guard.take();
++        self.cleanup_worker(old, "restart requested by worker response");
+         self.record_restart("restart requested by worker response");
++        if self.shutting_down.load(Ordering::Relaxed) {
++            return;
++        }
++        drop(guard);
+         thread::sleep(Duration::from_secs(1));
++        if self.shutting_down.load(Ordering::Relaxed) {
++            return;
++        }
+         let mut guard = match self.proc.lock() {
+             Ok(g) => g,
+             Err(_) => return,
+@@ -335,14 +412,23 @@ impl Worker {
+         }
+     }
+ 
++    fn cleanup_worker(&self, proc: Option<WorkerProcess>, reason: &'static str) {
++        stop_worker(proc, reason);
++        self.pid.store(0, Ordering::Relaxed);
++    }
++
+     fn abandon_locked_worker(
+         &self,
+         guard: &mut MutexGuard<'_, Option<WorkerProcess>>,
+         reason: &'static str,
+     ) {
+         let old = guard.take();
++        if self.shutting_down.load(Ordering::Relaxed) {
++            stop_worker(old, reason);
++        } else {
++            self.cleanup_worker(old, reason);
++        }
+         self.pid.store(0, Ordering::Relaxed);
+-        cleanup_worker(old, reason);
+         self.record_restart(reason);
+     }
+ 
+@@ -357,7 +443,7 @@ impl Worker {
+         if !stuck {
+             return;
+         }
+-        let pid = self.pid.swap(0, Ordering::Relaxed);
++        let pid = self.pid.load(Ordering::Relaxed);
+         if pid == 0 {
+             eprintln!(
+                 "wrapperd: fatal: worker request is stale, but no worker pid is available; exiting for container restart"
+@@ -365,12 +451,10 @@ impl Worker {
+             std::process::exit(70);
+         }
+         self.record_restart(reason);
+-        thread::spawn(move || {
+-            eprintln!("wrapperd: killing stuck worker pid={pid}: {reason}");
+-            unsafe {
+-                libc::kill(pid as libc::pid_t, libc::SIGKILL);
+-            }
+-        });
++        eprintln!("wrapperd: killing stuck worker pid={pid}: {reason}");
++        unsafe {
++            libc::kill(pid as libc::pid_t, libc::SIGKILL);
++        }
+     }
+ }
+ 
+@@ -440,13 +524,43 @@ fn lock_worker_timeout(
+     }
+ }
+ 
+-fn cleanup_worker(proc: Option<WorkerProcess>, reason: &'static str) {
++fn stop_worker(proc: Option<WorkerProcess>, reason: &'static str) {
+     if let Some(mut proc) = proc {
+-        thread::spawn(move || {
+-            eprintln!("wrapperd: cleaning up old worker: {reason}");
+-            let _ = proc.child.kill();
+-            let _ = proc.child.wait();
+-        });
++        eprintln!("wrapperd: reaping ipc worker: {reason}");
++        stop_child(&mut proc.child, reason);
++    }
++}
++
++fn stop_child(child: &mut Child, reason: &'static str) {
++    unsafe {
++        libc::kill(child.id() as libc::pid_t, libc::SIGTERM);
++    }
++    let deadline = Instant::now() + Duration::from_millis(750);
++    loop {
++        match child.try_wait() {
++            Ok(Some(_)) => return,
++            Ok(None) if Instant::now() < deadline => {
++                thread::sleep(Duration::from_millis(20));
++            }
++            Ok(None) => {
++                eprintln!("wrapperd: forcing ipc worker exit after {reason}");
++                let _ = child.kill();
++                let _ = child.wait();
++                return;
++            }
++            Err(error) => {
++                eprintln!("wrapperd: failed checking ipc worker after {reason}: {error}");
++                let _ = child.kill();
++                let _ = child.wait();
++                return;
++            }
++        }
++    }
++}
++
++impl Drop for Worker {
++    fn drop(&mut self) {
++        self.shutdown();
+     }
+ }
+ 
+@@ -633,3 +747,131 @@ fn parse_worker_response(frame: protocol::Frame) -> Result<WorkerResponse, Worke
+         restart_worker,
+     })
+ }
++
++#[cfg(test)]
++mod lifecycle_tests {
++    use super::*;
++    use std::os::unix::fs::PermissionsExt;
++    use std::sync::mpsc;
++    use std::sync::Arc;
++
++    #[test]
++    fn restart_cleanup_serializes_concurrent_worker_start() {
++        let unique = std::time::SystemTime::now()
++            .duration_since(std::time::UNIX_EPOCH)
++            .expect("system clock after epoch")
++            .as_nanos();
++        let script = std::env::temp_dir().join(format!(
++            "wrapperd-dummy-launcher-{}-{unique}",
++            std::process::id(),
++        ));
++        std::fs::write(
++            &script,
++            "#!/bin/sh\ntrap '' TERM\nprintf 'READY\\n'\nwhile IFS= read -r line; do :; done\n",
++        )
++        .expect("write dummy launcher");
++        let mut permissions = std::fs::metadata(&script)
++            .expect("stat dummy launcher")
++            .permissions();
++        permissions.set_mode(0o755);
++        std::fs::set_permissions(&script, permissions).expect("make dummy launcher executable");
++
++        let worker = Arc::new(Worker::new(script.to_str().unwrap(), "test".to_string()));
++        worker.ensure_started().expect("start initial dummy worker");
++        wait_for_ready(&worker);
++        let old_pid = worker.pid.load(Ordering::Relaxed);
++        assert_ne!(old_pid, 0);
++
++        // Queue restart behind this lock so the concurrent ensure_started call
++        // observes the process slot during old-child cleanup.
++        let held = worker.proc.lock().expect("lock worker process slot");
++        let restarting_worker = Arc::clone(&worker);
++        let (restart_started_tx, restart_started_rx) = mpsc::channel();
++        let restart_thread = thread::spawn(move || {
++            restart_started_tx.send(()).unwrap();
++            restarting_worker.restart_after_delay();
++        });
++        restart_started_rx.recv().expect("restart thread started");
++        drop(held);
++
++        let lock_deadline = Instant::now() + Duration::from_millis(500);
++        let restart_holds_slot = loop {
++            match worker.proc.try_lock() {
++                Err(TryLockError::WouldBlock) => break true,
++                Ok(guard) => {
++                    let empty = guard.is_none();
++                    drop(guard);
++                    if empty || Instant::now() >= lock_deadline {
++                        break false;
++                    }
++                    thread::sleep(Duration::from_millis(2));
++                }
++                Err(TryLockError::Poisoned(_)) => panic!("worker process slot poisoned"),
++            }
++        };
++        assert!(
++            restart_holds_slot,
++            "restart cleanup must retain the process mutex while reaping the old child"
++        );
++        assert_eq!(worker.pid.load(Ordering::Relaxed), old_pid);
++
++        let concurrent_worker = Arc::clone(&worker);
++        let (start_result_tx, start_result_rx) = mpsc::channel();
++        let start_thread = thread::spawn(move || {
++            start_result_tx
++                .send(concurrent_worker.ensure_started().is_ok())
++                .unwrap();
++        });
++        assert!(
++            start_result_rx
++                .recv_timeout(Duration::from_millis(100))
++                .is_err(),
++            "concurrent worker start must wait for old-child cleanup"
++        );
++        assert!(start_result_rx
++            .recv_timeout(Duration::from_secs(3))
++            .expect("concurrent worker start completes after cleanup"));
++        start_thread.join().expect("start thread joins");
++        wait_for_ready(&worker);
++        restart_thread.join().expect("restart thread joins");
++
++        let new_pid = worker.pid.load(Ordering::Relaxed);
++        assert_ne!(new_pid, 0);
++        assert_ne!(new_pid, old_pid);
++        assert_eq!(
++            unsafe { libc::kill(new_pid as libc::pid_t, 0) },
++            0,
++            "tracked replacement worker must still be alive"
++        );
++
++        worker.shutdown();
++        assert_eq!(worker.pid.load(Ordering::Relaxed), 0);
++        let _ = std::fs::remove_file(script);
++    }
++
++    fn wait_for_ready(worker: &Worker) {
++        let deadline = Instant::now() + Duration::from_secs(2);
++        let mut output = Vec::new();
++        while Instant::now() < deadline {
++            let mut guard = worker.proc.lock().expect("lock worker process slot");
++            let proc = guard.as_mut().expect("dummy worker exists");
++            let mut byte = [0u8; 1];
++            match proc.stdout.read(&mut byte) {
++                Ok(0) => panic!("dummy launcher closed stdout before readiness"),
++                Ok(_) => {
++                    output.push(byte[0]);
++                    if output.ends_with(b"READY\n") {
++                        return;
++                    }
++                }
++                Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
++                    drop(guard);
++                    thread::sleep(Duration::from_millis(5));
++                }
++                Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
++                Err(error) => panic!("read dummy launcher readiness: {error}"),
++            }
++        }
++        panic!("dummy launcher did not become ready; output={output:?}");
++    }
++}
+diff --git a/tools/start-worker.sh b/tools/start-worker.sh
+new file mode 100644
+index 0000000..6b65f00
+--- /dev/null
++++ b/tools/start-worker.sh
+@@ -0,0 +1,4 @@
++#!/bin/sh
++# Invoke the packaged emulator explicitly; runtime needs no host binfmt rule.
++export WRAPPER_QEMU_PATH=/system/bin/qemu-x86_64-static
++exec /usr/local/bin/qemu-x86_64-static /app/wrapper-x86 "$@"
+diff --git a/tools/test-dockerignore.sh b/tools/test-dockerignore.sh
+new file mode 100755
+index 0000000..987d0d1
+--- /dev/null
++++ b/tools/test-dockerignore.sh
+@@ -0,0 +1,33 @@
++#!/usr/bin/env bash
++set -euo pipefail
++
++SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
++REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
++command -v docker >/dev/null || { echo "test-dockerignore: docker is required" >&2; exit 2; }
++
++TMP=$(mktemp -d "${TMPDIR:-/tmp}/wrapper-dockerignore.XXXXXX")
++trap 'rm -rf "$TMP"' EXIT
++CONTEXT="$TMP/context"
++OUTPUT="$TMP/output"
++mkdir -p "$CONTEXT/rootfs/data/data/com.apple.android.music/files" \
++    "$CONTEXT/data/session" "$CONTEXT/src" "$OUTPUT"
++cp "$REPO_ROOT/.dockerignore" "$CONTEXT/.dockerignore"
++printf 'FROM scratch\nCOPY . /context\n' > "$TMP/Dockerfile"
++
++# Deliberately use non-sensitive markers: the only purpose is to prove these
++# account-state locations are absent from a generated image context.
++printf 'fake-rootfs-session-marker\n' > "$CONTEXT/rootfs/data/data/com.apple.android.music/files/session.json"
++printf 'fake-session-marker\n' > "$CONTEXT/data/session/session.json"
++printf 'fake-env-marker\n' > "$CONTEXT/.env"
++printf 'fake-secret-marker\n' > "$CONTEXT/.env.test"
++printf 'safe-build-input\n' > "$CONTEXT/src/source.cpp"
++
++docker buildx build --quiet --output "type=local,dest=$OUTPUT" \
++    -f "$TMP/Dockerfile" "$CONTEXT"
++
++test -f "$OUTPUT/context/src/source.cpp"
++test ! -e "$OUTPUT/context/rootfs/data/data/com.apple.android.music/files/session.json"
++test ! -e "$OUTPUT/context/data/session/session.json"
++test ! -e "$OUTPUT/context/.env"
++test ! -e "$OUTPUT/context/.env.test"
++echo "test-dockerignore: rootfs account data, data/, and .env files excluded; safe source included"
+diff --git a/tools/test-page-compat.cpp b/tools/test-page-compat.cpp
+new file mode 100644
+index 0000000..be26da3
+--- /dev/null
++++ b/tools/test-page-compat.cpp
+@@ -0,0 +1,36 @@
++#include <cassert>
++#include <cerrno>
++#include <cstdio>
++#include <cstdint>
++#include <cstdlib>
++#include <cstring>
++#include <sys/mman.h>
++#include <unistd.h>
++
++int main() {
++    const auto page = static_cast<std::size_t>(sysconf(_SC_PAGESIZE));
++    const auto guard_page = page > 16384 ? page : 16384;
++    char setting[32];
++    std::snprintf(setting, sizeof(setting), "%zu", guard_page);
++    setenv("WRAPPER_HOST_PAGE_SIZE", setting, 1);
++    auto* mapping = static_cast<unsigned char*>(mmap(
++        nullptr, 3 * guard_page, PROT_READ | PROT_WRITE,
++        MAP_PRIVATE | MAP_ANONYMOUS, -1, 0));
++    assert(mapping != MAP_FAILED);
++    const auto aligned_value =
++        (reinterpret_cast<std::uintptr_t>(mapping) + guard_page - 1) &
++        ~(guard_page - 1);
++    auto* region = reinterpret_cast<unsigned char*>(aligned_value);
++    std::memset(region, 0x5a, 2 * guard_page);
++
++    assert(madvise(region, 4096, MADV_DONTNEED) == -1 && errno == EINVAL);
++    for (std::size_t i = 0; i < 2 * guard_page; ++i) assert(region[i] == 0x5a);
++    assert(madvise(region, guard_page, MADV_DONTNEED) == 0);
++    for (std::size_t i = 0; i < guard_page; ++i) assert(region[i] == 0);
++    for (std::size_t i = guard_page; i < 2 * guard_page; ++i) assert(region[i] == 0x5a);
++
++    setenv("WRAPPER_HOST_PAGE_SIZE", "0", 1);
++    std::memset(region, 0x5a, page);
++    assert(madvise(region, page, MADV_DONTNEED) == 0);
++    assert(munmap(mapping, 3 * guard_page) == 0);
++}
