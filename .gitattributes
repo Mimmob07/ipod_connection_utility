@@ -1,0 +1,2 @@
+# Unified diff context lines may contain a single space by design.
+backend/patches/*.patch -whitespace

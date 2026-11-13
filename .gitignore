@@ -1,0 +1,15 @@
+.DS_Store
+dummy_ipod/
+dummy_downloads/
+local/
+target/
+.wrapper-v2/
+.wrapper-v2-x86/
+*.apkm
+*.apk
+.venv/
+.wrapper-test/
+__pycache__/
+.pytest_cache/
+*.log
+data/
