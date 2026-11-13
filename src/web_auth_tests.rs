@@ -247,7 +247,8 @@ fn stdout_flood_fails_before_timeout_without_pipe_deadlock() {
     let python = root.join("fake-python");
     fs::write(
         &python,
-        "#!/usr/bin/python3\nimport os, time\nos.write(1, b'x' * 1000000)\ntime.sleep(5)\n",
+        // sh, not python: cold interpreter startup on CI ate the 700 ms budget.
+        "#!/bin/sh\nhead -c 1000000 /dev/zero\nexec sleep 5\n",
     )
     .unwrap();
     fs::set_permissions(&python, fs::Permissions::from_mode(0o700)).unwrap();
