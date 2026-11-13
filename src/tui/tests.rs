@@ -57,6 +57,21 @@ fn last_log(app: &App) -> (Level, &str) {
 }
 
 #[test]
+fn library_folders_are_relative_to_a_non_canonical_library_path() {
+    let fixture = Fixture::new("tui_relative_folder");
+    // Like a symlink or macOS /var, this spelling differs from the canonical manifest paths.
+    let mut app = App::new(format!("{}/album/..", fixture.lib()), fixture.ipod());
+    press(&mut app, KeyCode::Char('i'));
+    press(&mut app, KeyCode::Char('y'));
+    wait_for_job(&mut app);
+    press(&mut app, KeyCode::Char('2'));
+    let library = screen(&mut app, 100, 30);
+    let rows: Vec<_> = library.lines().filter(|row| row.contains(".mp3")).collect();
+    assert_eq!(rows.len(), 5);
+    assert!(rows.iter().all(|row| !row.contains('/')));
+}
+
+#[test]
 fn initialize_scan_and_sync_from_the_keyboard() {
     let fixture = Fixture::new("tui_flow");
     let mut app = App::new(fixture.lib(), fixture.ipod());

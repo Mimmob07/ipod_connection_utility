@@ -325,10 +325,12 @@ def test_session_under_sticky_tmp_imports(monkeypatch):
     """Regression: imports failed whenever any ancestor was sticky /tmp."""
     import os
     import tempfile
-    info = os.stat("/tmp")
+    # The store refuses symlinked ancestors such as macOS /tmp -> /private/tmp.
+    tmp = os.path.realpath("/tmp")
+    info = os.stat(tmp)
     if not (info.st_uid == 0 and info.st_mode & _stat.S_ISVTX):
         pytest.skip("/tmp is not root-owned sticky on this host")
-    with tempfile.TemporaryDirectory(dir="/tmp") as base:
+    with tempfile.TemporaryDirectory(dir=tmp) as base:
         base = pathlib_Path(base)
         source = base / "source"
         source.write_text(COOKIE)

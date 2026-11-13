@@ -522,6 +522,8 @@ pub(crate) mod tests {
             let _ = fs::remove_dir_all(&root);
             fs::create_dir_all(root.join("lib/album")).unwrap();
             fs::create_dir_all(root.join("ipod")).unwrap();
+            // Scans report canonical paths; macOS temp_dir() is under the /var symlink.
+            let root = root.canonicalize().unwrap();
 
             let fixture = Fixture { root };
             for name in ["a.mp3", "b.mp3", "c.mp3", "d.mp3", "album/e.mp3"] {
@@ -890,7 +892,12 @@ pub(crate) mod tests {
             fs::read_to_string(fixture.ipod_file("A.MP3")).unwrap(),
             "changed song"
         );
-        assert!(!fixture.ipod_file("a.mp3").exists());
+        // exists() would also match "A.MP3" on case-insensitive filesystems (macOS).
+        let names: Vec<_> = fs::read_dir(fixture.ipod())
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name())
+            .collect();
+        assert!(names.contains(&"A.MP3".into()) && !names.contains(&"a.mp3".into()));
     }
 
     #[test]

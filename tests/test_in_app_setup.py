@@ -55,7 +55,8 @@ class InAppSetup(unittest.TestCase):
         wizard.write_text('#!/bin/sh\nprintf "%s\\n" "$@" "no-launch=$IPOD_INSTALLER_NO_LAUNCH" > "$IPOD_SETUP_TEST_LOG"\nexit 7\n')
         wizard.chmod(0o755)
         self.log = self.root / 'setup-argv'
-        self.library = self.root / 'library'
+        # Not 'library': on case-insensitive macOS that is $HOME/Library, where Apple's python3 caches.
+        self.library = self.root / 'music'
         self.library.mkdir()
         self.master, slave = pty.openpty()
         fcntl.ioctl(slave, termios.TIOCSWINSZ, struct.pack('HHHH', 35, 150, 0, 0))

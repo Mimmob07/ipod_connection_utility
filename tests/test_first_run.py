@@ -47,9 +47,11 @@ class Paths(unittest.TestCase):
         os.close(slave)
         self.output = b''
 
-    def wait_text(self, text):
+    def pump(self, done):
+        """Keep reading until done(): the app blocks once the pty buffer fills, and
+        macOS pty buffers hold less than one full frame."""
         deadline = time.monotonic() + 4
-        while time.monotonic() < deadline:
+        while not done() and time.monotonic() < deadline:
             readable, _, _ = select.select([self.master], [], [], .05)
             if readable:
                 try:
@@ -58,10 +60,20 @@ class Paths(unittest.TestCase):
                     break
                 if b'\x1b[6n' in self.output:
                     os.write(self.master, b'\x1b[1;1R')
+        return done()
+
+    def wait_text(self, text):
+        def found():
             clean = re.sub(rb'\x1b\[[0-?]*[ -/]*[@-~]', b'', self.output)
-            if b''.join(text.encode().split()) in b''.join(clean.split()):
-                return
-        self.fail(f'{text!r} not in terminal output: {self.output[-1500:]!r}')
+            return b''.join(text.encode().split()) in b''.join(clean.split())
+        if not self.pump(found):
+            self.fail(f'{text!r} not in terminal output: {self.output[-1500:]!r}')
+
+    def quit(self, key=b'q'):
+        os.write(self.master, key)
+        assert self.child is not None
+        self.pump(lambda: self.child.poll() is not None)
+        self.assertEqual(self.child.wait(timeout=1), 0)
 
     def seed(self, value):
         self.settings.parent.mkdir(parents=True)
@@ -71,33 +83,25 @@ class Paths(unittest.TestCase):
         self.start()
         self.wait_text('Local library path')
         os.write(self.master, str(self.library).encode() + b'\r')
-        deadline = time.monotonic() + 4
-        while not self.settings.exists() and time.monotonic() < deadline:
-            time.sleep(.02)
-        self.assertTrue(self.settings.exists(), 'selected path was not saved')
-        self.assertEqual(json.loads(self.settings.read_text())['local_path'], str(self.library))
+        self.assertTrue(self.pump(self.settings.exists), 'selected path was not saved')
+        # Saved folders are canonical; macOS TMPDIR is under the /var symlink.
+        self.assertEqual(json.loads(self.settings.read_text())['local_path'], str(self.library.resolve()))
         self.assertFalse((self.library / 'data.json').exists(), 'first launch must not initialize music')
-        os.write(self.master, b'q')
-        assert self.child is not None
-        self.assertEqual(self.child.wait(timeout=4), 0)
+        self.quit()
 
     def test_saved_paths_are_shown_on_launch(self):
         self.seed({'local_path': str(self.library), 'ipod_path': str(self.device)})
         self.start()
         self.wait_text(str(self.library))
         self.wait_text(str(self.device))
-        os.write(self.master, b'q')
-        assert self.child is not None
-        self.assertEqual(self.child.wait(timeout=4), 0)
+        self.quit()
 
     def test_explicit_interactive_paths_override_saved_values(self):
         self.seed({'local_path': '/must-not-use', 'ipod_path': '/must-not-use-either'})
         self.start('-l', str(self.library), '-p', str(self.device))
         self.wait_text(str(self.library))
         self.wait_text(str(self.device))
-        os.write(self.master, b'q')
-        assert self.child is not None
-        self.assertEqual(self.child.wait(timeout=4), 0)
+        self.quit()
 
     def test_saved_device_never_authorizes_noninteractive_sync(self):
         self.seed({'local_path': str(self.library), 'ipod_path': str(self.device)})
@@ -114,9 +118,7 @@ class Paths(unittest.TestCase):
         self.settings.write_text('broken json')
         self.start()
         self.wait_text('Local library path')
-        os.write(self.master, b'\x03')
-        assert self.child is not None
-        self.assertEqual(self.child.wait(timeout=4), 0)
+        self.quit(b'\x03')
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser()

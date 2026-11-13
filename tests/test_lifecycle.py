@@ -248,27 +248,13 @@ class Lifecycle(unittest.TestCase):
         self.assertFalse(error_path.exists())
 
     def test_basic_downloader_does_not_start_wrapper(self):
-        master, slave = pty.openpty()
-        fcntl.ioctl(slave, termios.TIOCSWINSZ, struct.pack("HHHH", 30, 120, 0, 0))
-        child = subprocess.Popen([str(BINARY), "-l", str(self.root)], stdin=slave,
-                                 stdout=slave, stderr=slave, env=self.env)
-        self.children.append(child)
-        os.close(slave)
-        try:
-            output = bytearray()
-            deadline = time.monotonic() + 5
-            while b"Overview" not in output and time.monotonic() < deadline:
-                readable, _, _ = select.select([master], [], [], 0.1)
-                if readable:
-                    output.extend(os.read(master, 65536))
-            self.assertIn(b"Overview", output)
-            os.write(master, b"4")
-            time.sleep(0.4)
-            os.write(master, b"q")
-            self.assertEqual(child.wait(timeout=3), 0)
-            self.assertEqual(self.records(), [], "basic AAC tab must not invoke Docker")
-        finally:
-            os.close(master)
+        child, master, output = self.tui()
+        wait_for(lambda: b"Overview" in output)
+        os.write(master, b"4")
+        time.sleep(0.4)
+        os.write(master, b"q")
+        self.assertEqual(child.wait(timeout=3), 0)
+        self.assertEqual(self.records(), [], "basic AAC tab must not invoke Docker")
 
     def test_tui_lazy_start_detaches_manager_and_quits_before_cleanup(self):
         self.assert_tui_cleanup(b"q")
@@ -276,12 +262,13 @@ class Lifecycle(unittest.TestCase):
     def test_tui_ctrl_c_returns_before_background_cleanup(self):
         self.assert_tui_cleanup(b"\x03")
 
-    def assert_tui_cleanup(self, quit_key):
+    def tui(self, **extra):
+        """Run the TUI on a pty drained by a thread: the app blocks once a pty buffer
+        fills, and macOS pty buffers hold less than one full frame."""
         master, slave = pty.openpty()
         fcntl.ioctl(slave, termios.TIOCSWINSZ, struct.pack("HHHH", 30, 120, 0, 0))
         child = subprocess.Popen([str(BINARY), "-l", str(self.root)], stdin=slave,
-                                 stdout=slave, stderr=slave,
-                                 env={**self.env, "FAKE_STOP_DELAY": "2"})
+                                 stdout=slave, stderr=slave, env={**self.env, **extra})
         self.children.append(child)
         os.close(slave)
         output = bytearray()
@@ -298,24 +285,30 @@ class Lifecycle(unittest.TestCase):
 
         reader = threading.Thread(target=drain, daemon=True)
         reader.start()
-        try:
-            wait_for(lambda: b"Overview" in output)
-            self.assertEqual(self.records(), [], "Core TUI must not invoke Docker")
-            os.write(master, b"4vv")  # Select ALAC on Downloader before wrapper startup.
-            wait_for(lambda: any(r["action"] == "up" for r in self.records()))
-            record = next(r for r in self.records() if r["action"] == "up")
-            self.assertEqual(record["parent"], record["session"], "Manager must own a POSIX session")
-            self.assertNotEqual(record["parent"], child.pid)
-            started = time.monotonic()
-            os.write(master, quit_key)
-            self.assertEqual(child.wait(timeout=1.5), 0)
-            self.assertLess(time.monotonic() - started, 1.5)
-            wait_for(lambda: Path(self.env["FAKE_STOPPED"]).exists())
-            self.assertEqual([r["action"] for r in self.records()], ["ps", "up", "stop"])
-        finally:
+
+        def close():
             draining.set()
             reader.join(timeout=2)
             os.close(master)
+
+        self.addCleanup(close)
+        return child, master, output
+
+    def assert_tui_cleanup(self, quit_key):
+        child, master, output = self.tui(FAKE_STOP_DELAY="2")
+        wait_for(lambda: b"Overview" in output)
+        self.assertEqual(self.records(), [], "Core TUI must not invoke Docker")
+        os.write(master, b"4vv")  # Select ALAC on Downloader before wrapper startup.
+        wait_for(lambda: any(r["action"] == "up" for r in self.records()))
+        record = next(r for r in self.records() if r["action"] == "up")
+        self.assertEqual(record["parent"], record["session"], "Manager must own a POSIX session")
+        self.assertNotEqual(record["parent"], child.pid)
+        started = time.monotonic()
+        os.write(master, quit_key)
+        self.assertEqual(child.wait(timeout=1.5), 0)
+        self.assertLess(time.monotonic() - started, 1.5)
+        wait_for(lambda: Path(self.env["FAKE_STOPPED"]).exists())
+        self.assertEqual([r["action"] for r in self.records()], ["ps", "up", "stop"])
 
 
 if __name__ == "__main__":

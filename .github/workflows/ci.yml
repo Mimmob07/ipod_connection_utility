@@ -25,6 +25,11 @@ jobs:
           components: clippy,rustfmt
       - run: python3 -m venv .venv
       - run: .venv/bin/python -m pip install mutagen pillow pytest
+      # Download save tests decode real audio with ffmpeg.
+      - if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y ffmpeg
+      - if: runner.os == 'macOS'
+        run: brew install ffmpeg
       - run: cargo test --locked
         env:
           IPOD_PYTHON: ${{ github.workspace }}/.venv/bin/python

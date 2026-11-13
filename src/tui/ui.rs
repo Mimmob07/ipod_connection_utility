@@ -8,7 +8,7 @@ use ratatui::layout::{Constraint, Flex, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Clear, Padding, Paragraph, Row, Table, Tabs, Wrap};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::time::SystemTime;
 
 const MIN_WIDTH: u16 = 60;
@@ -198,10 +198,11 @@ fn draw_library(frame: &mut Frame, app: &mut App, area: Rect) {
         app.manifest.len(),
         human_size(app.manifest.iter().map(|x| x.size).sum())
     );
+    let library = library(app);
     let rows = app.manifest.iter().map(|file| {
         Row::new([
             file_name(&file.file_path),
-            folder(&file.file_path, &app.local_path),
+            folder(&file.file_path, &library),
             human_size(file.size),
             age(file.mtime),
             format!("{:016x}", file.hash),
@@ -245,11 +246,12 @@ fn draw_sync(frame: &mut Frame, app: &mut App, area: Rect) {
         plan.update.len(),
         plan.delete.len()
     );
+    let library = library(app);
     let change = |action: &'static str, color: Color, path: &Path| {
         Row::new([
             Span::styled(action, Style::new().fg(color)),
             Span::raw(file_name(path)),
-            Span::raw(folder(path, &app.local_path)),
+            Span::raw(folder(path, &library)),
         ])
     };
     let rows = (plan
@@ -567,11 +569,18 @@ fn file_name(path: &Path) -> String {
         .into_owned()
 }
 
+/// Manifest and plan paths are canonical; the typed library path may be relative or symlinked.
+fn library(app: &App) -> PathBuf {
+    Path::new(&app.local_path)
+        .canonicalize()
+        .unwrap_or_else(|_| app.local_path.clone().into())
+}
+
 /// Folder of `path` inside the local library, empty for files at the top of it
-fn folder(path: &Path, local_path: &str) -> String {
+fn folder(path: &Path, library: &Path) -> String {
     let parent = path.parent().unwrap_or(Path::new(""));
     parent
-        .strip_prefix(local_path)
+        .strip_prefix(library)
         .unwrap_or(parent)
         .to_string_lossy()
         .into_owned()

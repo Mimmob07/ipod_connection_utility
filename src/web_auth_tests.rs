@@ -16,7 +16,8 @@ fn scratch() -> PathBuf {
     ));
     fs::create_dir(&root).unwrap();
     fs::set_permissions(&root, fs::Permissions::from_mode(0o700)).unwrap();
-    root
+    // The session store rejects symlinked ancestors such as macOS /var -> /private/var.
+    root.canonicalize().unwrap()
 }
 
 fn probe(root: &Path, scenario: &str, python: Option<&Path>) {
