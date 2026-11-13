@@ -1,0 +1,79 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    strategy:
+      fail-fast: false
+      matrix:
+        # shortcut: 22.04 keeps the glibc 2.35 baseline; runner unsupported from 2027-04, switch to a pinned older-glibc container or cargo-zigbuild before then.
+        os: [ubuntu-22.04, ubuntu-22.04-arm, macos-15]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.x'
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy,rustfmt
+      - run: python3 -m venv .venv
+      - run: .venv/bin/python -m pip install mutagen pillow pytest
+      - run: cargo test --locked
+        env:
+          IPOD_PYTHON: ${{ github.workspace }}/.venv/bin/python
+      - run: cargo build --locked
+      - run: cargo clippy --all-targets --locked -- -D warnings
+      - run: cargo fmt --check
+      - run: .venv/bin/python -m unittest discover -s tools -p 'test_*.py'
+      - run: .venv/bin/python -m pytest tools/test_apple_web_session.py
+      - run: python3 tests/test_package_release.py
+      - run: python3 tests/test_installer_wizard.py
+      - run: python3 tests/test_desktop_install.py
+      - run: python3 tests/test_first_run.py
+      - run: python3 tests/test_in_app_setup.py
+      - run: python3 tests/test_basic_installer.py
+      - run: python3 tests/test_upgrade_alias.py
+      - run: python3 tests/test_legacy_cleanup.py
+      - run: |
+          for script in scripts/*.sh tools/test_scripts.sh tools/test_setup_emulation.sh; do
+            bash -n "$script"
+          done
+      - run: bash tools/test_scripts.sh
+      - run: bash tools/test_setup_emulation.sh
+      - run: scripts/setup-backend.sh --help
+      - run: scripts/install.sh --help
+      - run: python3 tests/test_lifecycle.py --binary target/debug/ipod-connection-utility
+      - run: python3 tests/test_cli.py --binary target/debug/ipod-connection-utility
+      - if: runner.os == 'Linux'
+        run: |
+          git clone --quiet https://github.com/glomatico/wrapper-v2.git .wrapper-test
+          git -C .wrapper-test checkout --quiet --detach 100e0a864e883e03a3ac450a780dd9563fff5271
+          git -C .wrapper-test apply "$GITHUB_WORKSPACE/backend/patches/wrapper-portable.patch"
+          bash backend/validate-portable-patch.sh .wrapper-test
+          cargo test --locked --manifest-path .wrapper-test/Cargo.toml
+
+  minimum-rust:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.89.0
+      - run: cargo check --locked
+
+  cross-check:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-unknown-linux-gnu
+      - run: sudo apt-get update && sudo apt-get install -y gcc-aarch64-linux-gnu
+      - run: cargo check --locked --target aarch64-unknown-linux-gnu
+        env:
+          CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER: aarch64-linux-gnu-gcc
