@@ -62,7 +62,7 @@ class Backend(http.server.BaseHTTPRequestHandler):
         data = {"version": "test", "runtime": {"initialized": True, "playback_ready": True},
                 "auth": {"state": "authenticated"}}
         body = json.dumps(data).encode()
-        self.send_response(200)
+        self.send_response(200 if self.server.healthy else 503)
         self.send_header("Content-Length", str(len(body)))
         self.end_headers()
         self.wfile.write(body)
@@ -87,6 +87,7 @@ class Lifecycle(unittest.TestCase):
         docker.chmod(0o755)
         self.server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), Backend)
         self.server.daemon_threads = True
+        self.server.healthy = True
         self.thread = threading.Thread(target=self.server.serve_forever, daemon=True)
         self.thread.start()
         # Clear inherited app/Compose overrides so the test cannot touch real state.
@@ -166,6 +167,17 @@ class Lifecycle(unittest.TestCase):
         self.assertEqual(expected["DECRYPT_PORT"], "12345")
         self.assertTrue(Path(expected["WRAPPER_DATA_DIR"]).is_dir())
         self.assertNotIn(str(self.checkout), expected["WRAPPER_DATA_DIR"])
+
+    def test_backend_that_stops_responding_reports_failure_and_stops(self):
+        manager = self.manager()
+        self.assertTrue(self.event(manager)["Ready"]["authenticated"])
+        self.server.healthy = False
+        # Three failed checks, two seconds apart.
+        readable, _, _ = select.select([manager.stdout], [], [], 12)
+        self.assertTrue(readable, "Manager never reported the failed health checks")
+        self.assertIn("stopped responding", self.event(manager)["Failed"])
+        self.assertEqual(manager.wait(timeout=8), 0)
+        self.assertEqual([r["action"] for r in self.records()], ["ps", "up", "stop"])
 
     def test_saved_profile_backend_directory_is_used_without_environment_override(self):
         saved_checkout = self.root / "saved backend checkout with spaces"

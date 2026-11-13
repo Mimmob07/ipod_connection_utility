@@ -8,6 +8,7 @@ mod wrapper;
 use clap::Parser;
 use indicatif::{ProgressBar, ProgressStyle};
 use std::io::{self, IsTerminal};
+use std::process::ExitCode;
 
 /// A tool that helps you keep your local and ipod libraries up to date with each other
 #[derive(Parser, Debug)]
@@ -100,7 +101,16 @@ fn sync_once(local_path: &str, ipod_path: &str, dry_run: bool) -> io::Result<()>
     result
 }
 
-fn main() -> io::Result<()> {
+fn main() -> ExitCode {
+    // Display, not Debug, so errors read as sentences.
+    if let Err(error) = run() {
+        eprintln!("Error: {error}");
+        return ExitCode::FAILURE;
+    }
+    ExitCode::SUCCESS
+}
+
+fn run() -> io::Result<()> {
     if wrapper::run_manager_if_requested()? {
         return Ok(());
     }

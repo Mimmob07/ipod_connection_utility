@@ -191,7 +191,7 @@ case "$profile" in
         target_arch="x86_64"
         runtime_platform="linux/arm64"
         worker_mode="qemu_x86_64"
-        if ((page_size <= 4096)) || ! is_power_of_two "$page_size"; then
+        if ((page_size <= 4096)); then
             die "asahi-16k requires a Docker Linux page size greater than 4096"
         fi
         ;;

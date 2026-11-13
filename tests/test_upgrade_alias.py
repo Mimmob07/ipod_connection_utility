@@ -55,6 +55,15 @@ class UpgradeAliasTests(unittest.TestCase):
         self.assertFalse(collision.is_symlink())
         self.assertIn('icu', result.stdout.lower())
 
+    def test_user_replacement_of_recorded_alias_survives_reinstall(self):
+        self.assertEqual(self.install().returncode, 0)
+        alias = self.prefix / 'bin/icu'
+        alias.unlink()
+        alias.write_text('user command')
+        result = self.install()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(alias.read_text(), 'user command')
+
     def test_user_data_and_unrelated_bin_files_survive_upgrade(self):
         data = self.root / 'xdg data/ipod-connection-utility/web-auth/cookies.txt'
         data.parent.mkdir(parents=True)

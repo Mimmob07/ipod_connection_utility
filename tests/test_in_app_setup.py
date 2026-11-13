@@ -52,7 +52,11 @@ class InAppSetup(unittest.TestCase):
         binary = binary_dir / 'ipod-connection-utility'
         shutil.copy2(BINARY, binary)
         wizard = binary_dir / 'ipod-connection-utility-install-wizard'
-        wizard.write_text('#!/bin/sh\nprintf "%s\\n" "$@" "no-launch=$IPOD_INSTALLER_NO_LAUNCH" > "$IPOD_SETUP_TEST_LOG"\nexit 7\n')
+        wizard.write_text('#!/bin/sh\nprintf "%s\\n" "$@" "no-launch=$IPOD_INSTALLER_NO_LAUNCH" > "$IPOD_SETUP_TEST_LOG"\n'
+                          '[ -e "$IPOD_SETUP_TEST_LOG.sleep" ] && exec sleep 30\nexit 7\n')
+        gamdl = self.root / 'gamdl'
+        gamdl.write_text('#!/bin/sh\necho $$ > "$IPOD_SETUP_TEST_LOG.gamdl"\nexec sleep 30\n')
+        gamdl.chmod(0o755)
         wizard.chmod(0o755)
         self.log = self.root / 'setup-argv'
         # Not 'library': on case-insensitive macOS that is $HOME/Library, where Apple's python3 caches.
@@ -60,8 +64,11 @@ class InAppSetup(unittest.TestCase):
         self.library.mkdir()
         self.master, slave = pty.openpty()
         fcntl.ioctl(slave, termios.TIOCSWINSZ, struct.pack('HHHH', 35, 150, 0, 0))
+        # A controlling terminal, so Ctrl+C outside raw mode is a real SIGINT as for users.
         self.child = subprocess.Popen([str(binary), '-l', str(self.library)], stdin=slave, stdout=slave, stderr=slave,
-            env={**os.environ, 'HOME': str(self.root), 'XDG_DATA_HOME': str(self.root/'data'), 'TERM': 'xterm-256color', 'IPOD_SETUP_TEST_LOG': str(self.log)})
+            start_new_session=True, preexec_fn=lambda: fcntl.ioctl(0, termios.TIOCSCTTY, 0),
+            env={**os.environ, 'HOME': str(self.root), 'XDG_DATA_HOME': str(self.root/'data'), 'TERM': 'xterm-256color',
+                 'IPOD_SETUP_TEST_LOG': str(self.log), 'IPOD_GAMDL': str(gamdl)})
         self.addCleanup(self.close_child)
         os.close(slave)
         self.output = b''
@@ -72,8 +79,14 @@ class InAppSetup(unittest.TestCase):
     def close_child(self):
         if self.child.poll() is None:
             self.child.kill()
-            self.child.wait()
+            self.wait_exit()
         os.close(self.master)
+
+    def wait_exit(self, timeout=6):
+        # Drain while waiting: macOS blocks an exiting terminal owner until its output is read.
+        until=time.monotonic()+timeout
+        while self.child.poll() is None and time.monotonic()<until: self.drain(.05)
+        return self.child.poll()
 
     def wait_text(self, text):
         until = time.monotonic()+4
@@ -98,7 +111,16 @@ class InAppSetup(unittest.TestCase):
         self.assertIsNone(self.child.poll(), 'installer failure must not quit app')
         self.assertEqual(list(self.library.iterdir()), [])
         os.write(self.master,b'q')
-        self.assertEqual(self.child.wait(timeout=4),0)
+        self.assertEqual(self.wait_exit(),0)
+
+    def test_setup_still_runs_after_backend_failed(self):
+        os.write(self.master,b'vv')  # ALAC starts the backend, which fails: no profile here.
+        self.wait_text('Unavailable; see log')
+        os.write(self.master,b'u')
+        self.wait_text('Install advanced')
+        os.write(self.master,b'y')
+        self.wait_file(self.log)
+        self.wait_text('Setup exited')
 
     def test_basic_setup_uses_basic_wizard_mode(self):
         os.write(self.master,b'd')
@@ -110,6 +132,46 @@ class InAppSetup(unittest.TestCase):
         self.assertEqual(self.log.read_text().splitlines(),['--basic','no-launch=1'])
         self.wait_text('Setup exited')
         os.write(self.master,b'q')
-        self.assertEqual(self.child.wait(timeout=4),0)
+        self.assertEqual(self.wait_exit(),0)
+
+    def wait_file(self, path):
+        until=time.monotonic()+4
+        while not path.exists() and time.monotonic()<until: self.drain(.05)
+        self.assertTrue(path.exists(), f'{path.name} never appeared')
+
+    def drain(self, seconds):
+        # Keep reading: a full pty buffer blocks the app's next frame and key handling.
+        ready,_,_=select.select([self.master],[],[],seconds)
+        if ready:
+            try: self.output += os.read(self.master, 65536)
+            except OSError: pass
+
+    def test_ctrl_c_stops_only_the_installer(self):
+        Path(f'{self.log}.sleep').touch()
+        os.write(self.master,b'd')
+        self.wait_text('Set up basic')
+        os.write(self.master,b'y')
+        self.wait_file(self.log)
+        os.write(self.master,b'\x03')
+        self.wait_text('Setup exited')
+        self.assertIsNone(self.child.poll(), 'Ctrl+C in the installer must not quit the app')
+        os.write(self.master,b'q')
+        self.assertEqual(self.wait_exit(),0)
+
+    def test_ctrl_c_during_download_stops_gamdl_and_removes_staging(self):
+        cookies = self.root/'data/ipod-connection-utility/web-auth/cookies.txt'
+        cookies.parent.mkdir(parents=True)
+        cookies.write_text('# Netscape HTTP Cookie File\n.music.apple.com\tTRUE\t/\tTRUE\t0\tmedia-user-token\tsynthetic\n')
+        os.write(self.master,b'n')
+        self.drain(.3)
+        os.write(self.master,b'https://music.apple.com/us/song/x/123\r')
+        pid_file = Path(f'{self.log}.gamdl')
+        self.wait_file(pid_file)
+        self.assertTrue(list(self.library.glob('.ipod-download-*')), 'download staging was never created')
+        os.write(self.master,b'\x03')
+        self.assertEqual(self.wait_exit(), 0)
+        with self.assertRaises(ProcessLookupError):
+            os.kill(int(pid_file.read_text()), 0)
+        self.assertEqual(list(self.library.glob('.ipod-download-*')), [])
 
 if __name__ == '__main__': unittest.main()

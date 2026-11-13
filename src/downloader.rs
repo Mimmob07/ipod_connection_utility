@@ -212,7 +212,7 @@ impl fmt::Display for DownloadError {
             Self::WrapperUnavailable => write!(
                 f,
                 "wrapper-v2 is not available at 127.0.0.1:{}",
-                wrapper_port()
+                wrapper_port().unwrap_or_default()
             ),
             Self::SignInRequired => write!(f, "sign in on the Downloader tab (press c)"),
             Self::GamdlFailed => write!(f, "gamdl failed; check the track and subscription"),
@@ -246,8 +246,6 @@ impl Default for Downloader {
 }
 
 impl Downloader {
-    pub const IMPLEMENTED: bool = true;
-
     pub fn queue(&self) -> &[Download] {
         &self.queue
     }
@@ -519,25 +517,13 @@ fn parse_source(source: &str) -> Option<(SourceKind, String)> {
     }
 }
 
-fn port(primary: &str, compose: &str, default: u16) -> u16 {
-    let primary = std::env::var(primary).ok();
-    let compose = std::env::var(compose).ok();
-    port_values(primary.as_deref(), compose.as_deref(), default)
+fn wrapper_port() -> Result<u16, DownloadError> {
+    crate::wrapper::configured_port("IPOD_WRAPPER_HTTP_PORT", "HTTP_PORT", 8080)
+        .map_err(DownloadError::Backend)
 }
-
-fn port_values(primary: Option<&str>, compose: Option<&str>, default: u16) -> u16 {
-    primary
-        .or(compose)
-        .and_then(|value| value.parse::<u16>().ok())
-        .filter(|port| *port != 0)
-        .unwrap_or(default)
-}
-
-fn wrapper_port() -> u16 {
-    port("IPOD_WRAPPER_HTTP_PORT", "HTTP_PORT", 8080)
-}
-fn decrypt_port() -> u16 {
-    port("IPOD_WRAPPER_DECRYPT_PORT", "DECRYPT_PORT", 10020)
+fn decrypt_port() -> Result<u16, DownloadError> {
+    crate::wrapper::configured_port("IPOD_WRAPPER_DECRYPT_PORT", "DECRYPT_PORT", 10020)
+        .map_err(DownloadError::Backend)
 }
 
 /// Only speaks to loopback; response bodies can contain account tokens and are never logged.
@@ -546,7 +532,7 @@ fn wrapper_request(
     path: &str,
     body: Option<Value>,
 ) -> Result<(u16, Value), DownloadError> {
-    let addr = SocketAddr::from(([127, 0, 0, 1], wrapper_port()));
+    let addr = SocketAddr::from(([127, 0, 0, 1], wrapper_port()?));
     let mut stream = TcpStream::connect_timeout(&addr, Duration::from_secs(3))
         .map_err(|_| DownloadError::WrapperUnavailable)?;
     stream
@@ -720,10 +706,6 @@ fn wait_child_reporting(
     }
 }
 
-fn web_cookies_path() -> PathBuf {
-    crate::web_auth::cookies_path()
-}
-
 pub fn check_web_session(cancelled: &AtomicBool) -> Result<LoginResult, DownloadError> {
     crate::web_auth::check(cancelled).map(|()| LoginResult::Authenticated).map_err(|error| match error.as_str() {
         "sign_in_required" => DownloadError::SignInRequired,
@@ -758,13 +740,12 @@ fn download_once(
 ) -> Result<DownloadOutcome, DownloadError> {
     let source = &task.source;
     let id = &task.id;
-    let kind = task.kind;
     let options = task.options;
     let library = &task.library;
     on_progress(DownloadProgress::phase("Checking session"));
     match options.backend() {
         DownloadBackend::Wrapper => check_session()?,
-        DownloadBackend::Web if !web_cookies_path().is_file() => {
+        DownloadBackend::Web if !crate::web_auth::cookies_path().is_file() => {
             return Err(DownloadError::SignInRequired);
         }
         DownloadBackend::Web => {}
@@ -791,25 +772,24 @@ fn download_once(
         .map_err(|error| DownloadError::Backend(format!("cannot capture gamdl errors: {error}")))?;
 
     let executable = gamdl_executable();
-    let folder_template = match kind {
-        SourceKind::Song => "Staged",
-        SourceKind::Playlist => "Playlists/{playlist_title} by {playlist_artist}",
-    };
+    let folder_template = "Staged";
     let mut command = Command::new(executable);
     command.env("PYTHONUNBUFFERED", "1").arg("--no-config-file");
     match options.backend() {
         DownloadBackend::Web => {
-            command.arg("--cookies-path").arg(web_cookies_path());
+            command
+                .arg("--cookies-path")
+                .arg(crate::web_auth::cookies_path());
         }
         DownloadBackend::Wrapper => {
             command
                 .arg("--use-wrapper")
                 .arg("--wrapper-url")
-                .arg(format!("http://127.0.0.1:{}", wrapper_port()))
+                .arg(format!("http://127.0.0.1:{}", wrapper_port()?))
                 .arg("--wrapper-decrypt-host")
                 .arg("127.0.0.1")
                 .arg("--wrapper-decrypt-port")
-                .arg(decrypt_port().to_string());
+                .arg(decrypt_port()?.to_string());
         }
     }
     let mut child = command
@@ -838,13 +818,10 @@ fn download_once(
         .stderr(Stdio::from(error_file))
         .spawn()
         .map_err(|error| DownloadError::Backend(format!("cannot start gamdl: {error}")))?;
-    let timeout = match kind {
-        SourceKind::Song => Duration::from_secs(15 * 60),
-        SourceKind::Playlist => Duration::from_secs(4 * 60 * 60),
-    };
+    let timeout = Duration::from_secs(15 * 60);
     on_progress(DownloadProgress::phase("Downloading"));
     let status = progress::wait_download(&mut child, cancelled, timeout, &log_path, on_progress)?;
-    let log = fs::read_to_string(&log_path).unwrap_or_default();
+    let log = String::from_utf8_lossy(&fs::read(&log_path).unwrap_or_default()).into_owned();
     let log_summary = summarize_log(&log);
     if log_summary.auth_failed {
         return Err(DownloadError::SignInRequired);
@@ -887,7 +864,7 @@ fn download_once(
             outcome.invalid += 1;
             continue;
         };
-        if kind == SourceKind::Song && track_id != id {
+        if track_id != id {
             outcome.invalid += 1;
             continue;
         }
@@ -900,14 +877,10 @@ fn download_once(
             outcome.invalid += 1;
             continue;
         }
-        let playlist_folder = if let Some(playlist) = &task.playlist {
-            Some(playlist.folder.as_path())
-        } else if kind == SourceKind::Playlist {
-            file.parent()
-                .and_then(|parent| parent.strip_prefix(&output).ok())
-        } else {
-            None
-        };
+        let playlist_folder = task
+            .playlist
+            .as_ref()
+            .map(|playlist| playlist.folder.as_path());
         on_progress(DownloadProgress::phase("Preparing artwork"));
         let prepared =
             match prepare_download(&file, playlist_folder, options.rockbox_art, cancelled) {
@@ -1061,7 +1034,7 @@ fn gamdl_executable() -> PathBuf {
     PathBuf::from("gamdl")
 }
 
-fn python_executable() -> PathBuf {
+pub(crate) fn python_executable() -> PathBuf {
     std::env::var_os("IPOD_PYTHON")
         .map(PathBuf::from)
         .unwrap_or_else(|| {
@@ -1155,18 +1128,22 @@ struct LogSummary {
     issues: Vec<String>,
 }
 
-fn rate_limit_signal(line: &str) -> Option<&'static str> {
-    let lower = line.to_ascii_lowercase();
-    // Track names and processing URLs are data, not backend diagnostics. Keep
-    // only a trailing error after a quoted title, when one is present.
-    let diagnostic = ["downloading \"", "processing \"", "skipping \""]
+/// Track names and processing URLs are data, not backend diagnostics. Keep
+/// only a trailing error after a quoted title, when one is present.
+fn diagnostic_text(lower: &str) -> &str {
+    ["downloading \"", "processing \"", "skipping \""]
         .iter()
         .find_map(|marker| {
             lower
                 .split_once(marker)
                 .map(|(_, rest)| rest.split_once("\":").map_or("", |(_, error)| error))
         })
-        .unwrap_or(&lower);
+        .unwrap_or(lower)
+}
+
+fn rate_limit_signal(line: &str) -> Option<&'static str> {
+    let lower = line.to_ascii_lowercase();
+    let diagnostic = diagnostic_text(&lower);
     let words = format!(
         " {} ",
         diagnostic
@@ -1210,25 +1187,27 @@ fn summarize_log(log: &str) -> LogSummary {
     let mut result = LogSummary::default();
     for line in log.lines() {
         let lower = line.to_ascii_lowercase();
+        let diagnostic = diagnostic_text(&lower);
         if !result.rate_limited
             && let Some(reason) = rate_limit_signal(line)
         {
             result.rate_limited = true;
             result.issues.insert(0, reason.into());
         }
-        if lower.contains("unauthorized")
-            || lower.contains("not authenticated")
-            || lower.contains("session expired")
+        if diagnostic.contains("unauthorized")
+            || diagnostic.contains("not authenticated")
+            || diagnostic.contains("session expired")
         {
             result.auth_failed = true;
         }
-        if lower.contains("no active apple music subscription") {
+        if diagnostic.contains("no active apple music subscription") {
             result.subscription_required = true;
         }
-        if lower.contains("skipping ") {
-            let unavailable = lower.contains("not streamable")
-                || lower.contains("not available in your country")
-                || lower.contains("not available in your region");
+        // gamdl format: `Skipping "{title}": {error}`.
+        if lower.contains("skipping \"") {
+            let unavailable = diagnostic.contains("not streamable")
+                || diagnostic.contains("not available in your country")
+                || diagnostic.contains("not available in your region");
             if unavailable {
                 result.unavailable += 1;
             } else {
@@ -1387,15 +1366,6 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn wrapper_ports_use_primary_then_compose_then_default() {
-        assert_eq!(port_values(None, None, 8080), 8080);
-        assert_eq!(port_values(None, Some("9000"), 8080), 9000);
-        assert_eq!(port_values(Some("9001"), Some("9000"), 8080), 9001);
-        assert_eq!(port_values(Some("0"), Some("9000"), 8080), 8080);
-        assert_eq!(port_values(None, Some("bad"), 8080), 8080);
-    }
-
-    #[test]
     fn validates_song_and_playlist_links() {
         assert!(valid_track_id("i.ABC-123"));
         assert!(!valid_track_id("../bad"));
@@ -1549,6 +1519,20 @@ pub(crate) mod tests {
         );
         assert_eq!(failed.other_skipped, 1);
         assert!(failed.subscription_required);
+    }
+
+    #[test]
+    fn titles_and_urls_are_not_auth_or_skip_diagnostics() {
+        let parsed = summarize_log(
+            "[INFO] [Track 1/1] Downloading \"The Unauthorized Biography\"\n[INFO] Processing \"https://music.apple.com/us/album/the-unauthorized-biography/123?i=456\"\n[INFO] [Track 1/1] Downloading \"Skipping Stones\"",
+        );
+        assert!(!parsed.auth_failed);
+        assert_eq!(parsed.other_skipped, 0);
+        let failed = summarize_log(
+            "[ERROR] Error processing \"https://music.apple.com/us/song/x/1\": 401 Unauthorized\n[WARNING] [Track 1/1] Skipping \"Not Streamable Hits\": Requested format is not available",
+        );
+        assert!(failed.auth_failed);
+        assert_eq!((failed.unavailable, failed.other_skipped), (0, 2));
     }
 
     #[test]

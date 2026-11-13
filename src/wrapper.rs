@@ -202,7 +202,7 @@ fn configured_page_size_values(
     Ok(page_size)
 }
 
-fn configured_port(primary: &str, compose: &str, default: u16) -> Result<u16, String> {
+pub(crate) fn configured_port(primary: &str, compose: &str, default: u16) -> Result<u16, String> {
     let primary_value = std::env::var(primary).ok();
     let compose_value = std::env::var(compose).ok();
     parse_port_values(
@@ -285,8 +285,9 @@ pub enum Event {
 
 pub struct Session {
     events: Receiver<Event>,
-    // EOF on this pipe tells the detached manager to stop the container.
-    control: Option<ChildStdin>,
+    // Dropping this pipe sends EOF, which tells the detached manager to stop the
+    // container; cleanup and its lock stay in that process after this app exits.
+    _control: Option<ChildStdin>,
 }
 
 impl Session {
@@ -320,17 +321,14 @@ impl Session {
                 None
             }
         };
-        Self { events, control }
+        Self {
+            events,
+            _control: control,
+        }
     }
 
     pub fn poll(&self) -> Option<Event> {
         self.events.try_recv().ok()
-    }
-
-    pub fn shutdown(&mut self) {
-        // Closing the pipe is immediate; cleanup and its ownership lock remain
-        // in the detached process even after this app's threads disappear.
-        self.control.take();
     }
 }
 
@@ -357,12 +355,6 @@ fn launch_manager(executable: PathBuf) -> io::Result<Child> {
         }
     }
     command.spawn()
-}
-
-impl Drop for Session {
-    fn drop(&mut self) {
-        self.shutdown();
-    }
 }
 
 fn emit(event: Event) {

@@ -77,9 +77,9 @@ fn resolve_with_backend(
         DownloadBackend::Wrapper => {
             command
                 .arg("--wrapper-url")
-                .arg(format!("http://127.0.0.1:{}", wrapper_port()))
+                .arg(format!("http://127.0.0.1:{}", wrapper_port()?))
                 .arg("--decrypt-port")
-                .arg(decrypt_port().to_string());
+                .arg(decrypt_port()?.to_string());
         }
     }
     let mut child = command

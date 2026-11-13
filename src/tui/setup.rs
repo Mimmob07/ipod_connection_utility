@@ -24,7 +24,8 @@ fn wizard_at(executable: &Path) -> io::Result<PathBuf> {
 
 pub(super) fn run(backend: DownloadBackend) -> io::Result<ExitStatus> {
     let script = wizard_at(&std::env::current_exe()?)?;
-    Command::new("bash")
+    let mut command = Command::new("bash");
+    command
         .arg(script)
         .arg(if backend == DownloadBackend::Wrapper {
             "--advanced"
@@ -34,6 +35,26 @@ pub(super) fn run(backend: DownloadBackend) -> io::Result<ExitStatus> {
         .env("IPOD_INSTALLER_NO_LAUNCH", "1")
         .stdin(Stdio::inherit())
         .stdout(Stdio::inherit())
-        .stderr(Stdio::inherit())
-        .status()
+        .stderr(Stdio::inherit());
+    // Like system(): Ctrl+C stops the wizard, while the app and its queue survive.
+    #[cfg(unix)]
+    let previous = unsafe {
+        use std::os::unix::process::CommandExt;
+        command.pre_exec(|| {
+            libc::signal(libc::SIGINT, libc::SIG_DFL);
+            libc::signal(libc::SIGQUIT, libc::SIG_DFL);
+            Ok(())
+        });
+        [
+            libc::signal(libc::SIGINT, libc::SIG_IGN),
+            libc::signal(libc::SIGQUIT, libc::SIG_IGN),
+        ]
+    };
+    let status = command.status();
+    #[cfg(unix)]
+    unsafe {
+        libc::signal(libc::SIGINT, previous[0]);
+        libc::signal(libc::SIGQUIT, previous[1]);
+    }
+    status
 }

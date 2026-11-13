@@ -175,8 +175,8 @@ impl App {
             download_table: TableState::default().with_selected(0),
             modal: None,
             downloader: Downloader::default(),
-            wrapper_status: "Available".into(),
-            wrapper_ready: true,
+            wrapper_status: "Open Downloader to start Apple Music".into(),
+            wrapper_ready: false,
             web_status: if crate::web_auth::has_session() {
                 "Web session saved; checked when used".into()
             } else {
@@ -434,7 +434,8 @@ impl App {
     }
 
     fn ask(&mut self, target: Input) {
-        if self.busy() {
+        // Queueing only appends, so URLs can be added while a download runs.
+        if target != Input::Download && self.busy() {
             return;
         }
 
@@ -780,7 +781,8 @@ impl App {
                 }
             }
             Some(JobResult::WebLoggedIn(result)) => match result {
-                Ok(LoginResult::Authenticated) => {
+                // check_web_session only reports Authenticated; 2FA stays in the browser.
+                Ok(_) => {
                     self.web_status = "Signed in".into();
                     self.downloader.retry_sign_in_required(DownloadBackend::Web);
                     self.log(
@@ -788,10 +790,6 @@ impl App {
                         "Apple Music web session checked. Password/2FA stay in your browser.",
                     );
                 }
-                Ok(LoginResult::NeedsCode) => self.log(
-                    Level::Error,
-                    "Complete 2FA in the real browser and import cookies again",
-                ),
                 Err(error) => {
                     self.web_status = "Web session not verified; press c to retry".into();
                     self.log(Level::Error, format!("Web sign-in check failed: {error}"));
@@ -837,6 +835,10 @@ impl App {
                 authenticated,
             } => {
                 self.wrapper_ready = true;
+                if authenticated {
+                    self.downloader
+                        .retry_sign_in_required(DownloadBackend::Wrapper);
+                }
                 self.wrapper_status = if authenticated {
                     "Signed in"
                 } else {
@@ -859,6 +861,9 @@ impl App {
                 self.wrapper_ready = false;
                 self.wrapper_status = "Unavailable; see log".into();
                 self.log(Level::Error, error);
+                // Paused ALAC entries must not block AAC entries queued behind them.
+                self.downloader.pause_for_sign_in(DownloadBackend::Wrapper);
+                self.log(Level::Info, "Queued ALAC songs paused while Apple Music is unavailable; AAC songs continue. Press u to repair it; they resume once it is ready and signed in.");
             }
         }
     }

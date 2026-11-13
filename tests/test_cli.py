@@ -50,6 +50,14 @@ class CommandLine(unittest.TestCase):
             self.assertIn("--path is required", result.stderr)
         self.assertEqual(before, self.snapshot())
 
+    def test_uninitialized_library_explains_initialize(self):
+        before = self.snapshot()
+        for mode in ("--dry-run", "--no-tui"):
+            result = self.run_cli(mode, "-l", str(self.library), "-p", str(self.music.parent), succeeds=False)
+            self.assertIn("run with --initialize first", result.stderr)
+            self.assertNotIn("Os {", result.stderr)
+        self.assertEqual(before, self.snapshot())
+
     def test_initialize_preview_and_sync_without_docker(self):
         self.run_cli("--initialize", "-l", str(self.library))
         self.assertTrue((self.library / "data.json").is_file())

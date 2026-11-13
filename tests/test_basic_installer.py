@@ -82,16 +82,18 @@ fi
             self.assertEqual(result.returncode, 0, result.stderr)
             self.assertTrue((Path(self.env['HOME']) / suffix / 'ipod-connection-utility/gamdl/bin/gamdl').exists())
 
-    def test_missing_venv_is_detected_by_basic_dependency_check(self):
-        self.script('pacman', 'exit 91\n')
-        self.script('python3', '[[ "$*" != "-m venv --help" ]]\n')
+    def test_debian_python_without_ensurepip_plans_python3_venv(self):
+        self.script('apt-get', 'echo FORBIDDEN >> "$CALLS"; exit 91\n')
+        # Debian without python3-venv: `-m venv --help` works, only ensurepip is missing.
+        self.script('python3', '[[ "$*" != *ensurepip* ]]\n')
         os_release = self.base / 'os-release'
-        os_release.write_text('ID=alarm\n')
-        self.env['IPOD_OS_RELEASE_FILE'] = str(os_release)
-        result = subprocess.run([BASH, str(ROOT / 'scripts/install-dependencies.sh'), '--basic'],
+        os_release.write_text('ID=debian\nVERSION_ID="13"\n')
+        self.env.update(IPOD_OS_RELEASE_FILE=str(os_release), IPOD_DEPENDENCY_PATH=str(self.tools))
+        result = subprocess.run([BASH, str(ROOT / 'scripts/install-dependencies.sh'),
+                                 '--basic', '--yes', '--dry-run'],
                                 env=self.env, capture_output=True, text=True)
-        self.assertNotEqual(result.returncode, 0)
-        self.assertIn('venv', result.stderr)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn('apt-get install -y --no-upgrade python3-venv\n', result.stdout)
 
     def test_basic_dependency_plan_excludes_wrapper_tools(self):
         self.script('pacman', 'echo FORBIDDEN >> "$CALLS"; exit 91\n')

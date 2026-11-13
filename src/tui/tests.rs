@@ -217,6 +217,7 @@ fn downloader_tab_queues_song_and_playlist_links_and_masks_login() {
     assert!(!app.downloader.queue()[1].rockbox_art);
 
     press(&mut app, KeyCode::Char('v')); // ALAC retains the explicit advanced sign-in flow.
+    app.wrapper_ready = true;
     press(&mut app, KeyCode::Char('c'));
     type_text(&mut app, "name@example.com");
     press(&mut app, KeyCode::Enter);
@@ -438,6 +439,65 @@ fn recovered_download_shows_downloaded_and_keeps_rate_limit_backoff() {
     assert!(rendered.contains("Downloaded"));
     assert!(!rendered.contains("Partial"));
     assert!(app.download_cooldown_secs() >= 290);
+}
+
+#[test]
+fn failed_backend_lets_aac_entries_behind_alac_run() {
+    use crate::downloader::DownloadStatus;
+    let fixture = Fixture::new("tui_wrapper_failed_queue");
+    let mut app = App::new(fixture.lib(), fixture.ipod());
+    app.downloader.cycle_quality();
+    app.downloader.cycle_quality();
+    let alac = "https://music.apple.com/us/song/example/456";
+    app.downloader.enqueue(alac, &fixture.lib()).unwrap();
+    app.downloader.cycle_quality();
+    let aac = "https://music.apple.com/us/song/example/789";
+    app.downloader.enqueue(aac, &fixture.lib()).unwrap();
+    app.wrapper_event(crate::wrapper::Event::Failed("backend stopped".into()));
+    app.poll_job();
+    assert!(app.job.is_some());
+    let queue = app.downloader.queue();
+    assert!(matches!(queue[0].status, DownloadStatus::SignInRequired));
+    assert!(matches!(queue[1].status, DownloadStatus::Downloading));
+    assert!(last_log(&app).1.contains("ALAC songs paused"));
+}
+
+#[test]
+fn download_url_can_be_queued_while_a_download_runs() {
+    use super::app::{Input, Modal};
+    use super::worker::{Job, JobResult};
+    use crate::downloader::{DownloadError, DownloadStatus};
+    let fixture = Fixture::new("tui_queue_while_busy");
+    let mut app = App::new(fixture.lib(), fixture.ipod());
+    app.tab = Tab::Downloader;
+    app.downloader
+        .enqueue("https://music.apple.com/us/song/test/123", &fixture.lib())
+        .unwrap();
+    let running = app.downloader.next_queued().unwrap();
+    app.job = Some(Job::test_finished(JobResult::Downloaded {
+        index: running.index,
+        result: Err(DownloadError::GamdlFailed),
+    }));
+    press(&mut app, KeyCode::Char('n'));
+    assert!(matches!(
+        app.modal,
+        Some(Modal::Input {
+            target: Input::Download,
+            ..
+        })
+    ));
+    type_text(&mut app, "https://music.apple.com/us/song/test/456");
+    press(&mut app, KeyCode::Enter);
+    assert_eq!(app.downloader.queue().len(), 2);
+    assert!(matches!(
+        app.downloader.queue()[0].status,
+        DownloadStatus::Downloading
+    ));
+    // The running job's result still lands on its own entry.
+    app.poll_job();
+    let queue = app.downloader.queue();
+    assert!(matches!(queue[0].status, DownloadStatus::Failed(_)));
+    assert!(matches!(queue[1].status, DownloadStatus::Queued));
 }
 
 #[path = "web_tests.rs"]

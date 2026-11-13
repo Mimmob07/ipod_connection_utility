@@ -1,7 +1,7 @@
 //! Draws the `App`. Only the table scroll positions are written back.
 
 use super::app::{App, Database, KEYS, Level, Modal, Tab};
-use crate::downloader::{DownloadBackend, DownloadStatus, Downloader};
+use crate::downloader::{DownloadBackend, DownloadStatus};
 use crate::sync::DATA_FILE;
 use ratatui::Frame;
 use ratatui::layout::{Constraint, Flex, Layout, Rect};
@@ -61,13 +61,10 @@ fn panel(title: &str) -> Block<'_> {
 }
 
 fn draw_header(frame: &mut Frame, app: &App, area: Rect) {
-    let titles = Tab::ALL.iter().enumerate().map(|(idx, tab)| {
-        if *tab == Tab::Downloader && !Downloader::IMPLEMENTED {
-            format!("{} {} (planned)", idx + 1, tab.title())
-        } else {
-            format!("{} {}", idx + 1, tab.title())
-        }
-    });
+    let titles = Tab::ALL
+        .iter()
+        .enumerate()
+        .map(|(idx, tab)| format!("{} {}", idx + 1, tab.title()));
     let version = format!(" v{} ", env!("CARGO_PKG_VERSION"));
     let tabs = Tabs::new(titles)
         .select(app.tab.index())

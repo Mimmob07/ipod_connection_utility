@@ -15,35 +15,36 @@ const REDRAW_INTERVAL: Duration = Duration::from_millis(100);
 pub fn run(local_path: String, ipod_path: String) -> io::Result<()> {
     let mut terminal = ratatui::try_init()?;
     let mut app = App::new(local_path, ipod_path);
-    app.wrapper_ready = false;
-    app.wrapper_status = "Open Downloader to start Apple Music".into();
+    // Dropped on return: closing the session stops the backend it started.
     let mut wrapper = None;
-    let result = event_loop(&mut terminal, app, &mut wrapper);
+    let result = event_loop(&mut terminal, &mut app, &mut wrapper);
     ratatui::restore();
-    if let Some(wrapper) = &mut wrapper {
-        wrapper.shutdown();
+    // Let a cancelled download kill gamdl and remove its staging folder before exiting.
+    if let Some(job) = app.job.take() {
+        job.cancel_and_wait(Duration::from_secs(5));
     }
     result
 }
 
 fn event_loop(
     terminal: &mut DefaultTerminal,
-    mut app: App,
+    app: &mut App,
     wrapper: &mut Option<crate::wrapper::Session>,
 ) -> io::Result<()> {
     while !app.should_quit {
-        if let Some(backend) = app.pending_setup.take() {
-            if wrapper.is_some() {
-                app.log(app::Level::Error, "Advanced backend is already active. Restart the app and use setup before selecting ALAC; active account/session state was not changed.");
-            } else if app.job.is_none() {
-                ratatui::restore();
-                let result = setup::run(backend);
-                *terminal = ratatui::try_init()?;
-                match result {
-                    Ok(status) if status.success() => app.log(app::Level::Info, "Setup closed. Current queue preserved; sign in/check the session before downloading."),
-                    Ok(_) => app.log(app::Level::Error, "Setup exited unsuccessfully. Review the installer output; you can retry. Queue preserved."),
-                    Err(_) => app.log(app::Level::Error, "Setup could not start. Reinstall/extract the complete archive, including its installer wizard."),
-                }
+        if let Some(backend) = app.pending_setup.take()
+            && app.job.is_none()
+        {
+            // Stop this app's backend, even a failed one; it restarts after setup if needed.
+            *wrapper = None;
+            app.wrapper_ready = false;
+            ratatui::restore();
+            let result = setup::run(backend);
+            *terminal = ratatui::try_init()?;
+            match result {
+                Ok(status) if status.success() => app.log(app::Level::Info, "Setup closed. Current queue preserved; sign in/check the session before downloading."),
+                Ok(_) => app.log(app::Level::Error, "Setup exited unsuccessfully. Review the installer output; you can retry. Queue preserved."),
+                Err(_) => app.log(app::Level::Error, "Setup could not start. Reinstall/extract the complete archive, including its installer wizard."),
             }
         }
         if (app.downloader.backend() == crate::downloader::DownloadBackend::Wrapper
@@ -57,7 +58,7 @@ fn event_loop(
             app.wrapper_event(event);
         }
         app.poll_job();
-        terminal.draw(|frame| ui::draw(frame, &mut app))?;
+        terminal.draw(|frame| ui::draw(frame, app))?;
         app.tick += 1;
 
         if event::poll(REDRAW_INTERVAL)?

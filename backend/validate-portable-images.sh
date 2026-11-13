@@ -134,7 +134,7 @@ check_runtime() {
     }
   echo "$profile: deep health passed"
   if [[ "${IPOD_VALIDATION_PENDING_LOGIN:-0}" == 1 ]]; then
-    curl --max-time 45 -sS -o "$tmp/$profile-login-response.json" \
+    curl --max-time 45 -sS -o "$tmp/$profile-login-response.json" -w '%{http_code}' \
       -H 'Content-Type: application/json' \
       -d '{"apple_id":"offline-test@example.invalid","password":"not-a-real-password"}' \
       "http://$address:80/login" >"$tmp/$profile-login-status" 2>/dev/null &

@@ -123,7 +123,8 @@ Linux is root-equivalent; read each consent prompt.
 - **Uninstall** (no uninstall command yet), using your prefix if not `~/.local`:
 
   ```
-  rm -f ~/.local/bin/icu ~/.local/bin/ipod-connection-utility*
+  [ "$(readlink ~/.local/bin/icu)" = ipod-connection-utility ] && rm ~/.local/bin/icu   # only our alias
+  rm -f ~/.local/bin/ipod-connection-utility*
   rm -rf ~/.local/share/ipod-connection-utility
   rm -f ~/.local/share/applications/ipod-connection-utility.desktop   # Linux
   ```

@@ -63,7 +63,7 @@ def _parse_cookie_text_strict(text, now=None):
         if (subdomains not in {"TRUE", "FALSE"}
                 or secure not in {"TRUE", "FALSE"}
                 or not path.startswith("/")
-                or not expiry.isascii() or not expiry.lstrip("-").isdigit()
+                or not expiry.isascii() or not expiry.removeprefix("-").isdigit()
                 or any(ord(c) < 32 or ord(c) == 127 for c in line if c != "\t")):
             raise ImportProblem("not_cookie_file")
         records += 1
@@ -85,16 +85,11 @@ def _parse_cookie_text_strict(text, now=None):
     return found
 
 
-def _parse_cookie_text(text, now=None):
+def validate_cookie_text(text, now=None):
     try:
-        return _parse_cookie_text_strict(text, now)
+        return _parse_cookie_text_strict(text, now)[0]
     except ImportProblem:
         return None
-
-
-def validate_cookie_text(text, now=None):
-    parsed = _parse_cookie_text(text, now)
-    return parsed[0] if parsed else None
 
 def _is_private_group(gid):
     """True for a user-private group: the user's primary group, named after
@@ -170,10 +165,6 @@ def _read_cookie_file(path, dir_fd=None, private=False):
         if len(payload) > MAX_COOKIE_BYTES:
             raise ImportProblem("too_large")
     return payload.decode("utf-8")
-
-
-def import_cookie_file(source):
-    return import_cookie_file_detailed(source) is None
 
 
 def import_cookie_file_detailed(source):

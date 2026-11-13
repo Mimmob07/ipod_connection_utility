@@ -25,7 +25,7 @@ def test_host_only_cookie_is_canonical_for_gamdl(tmp_path, monkeypatch):
     source.write_text(COOKIE.replace(".music.apple.com\tTRUE", "music.apple.com\tFALSE"))
     target = tmp_path / "private" / "cookies.txt"
     monkeypatch.setattr(helper, "SESSION_PATH", target)
-    assert helper.import_cookie_file(source)
+    assert helper.import_cookie_file_detailed(source) is None
     jar = MozillaCookieJar(str(target))
     jar.load(ignore_discard=True, ignore_expires=True)
     assert [c.domain for c in jar] == [".music.apple.com"]
@@ -51,7 +51,7 @@ def test_httponly_cookie_import_round_trips_through_mozilla(tmp_path, monkeypatc
     target = tmp_path / "private" / "cookies.txt"
     monkeypatch.setattr(helper, "SESSION_PATH", target)
     assert helper.validate_cookie_text(source.read_text()) == "synthetic"
-    assert helper.import_cookie_file(source)
+    assert helper.import_cookie_file_detailed(source) is None
     jar = MozillaCookieJar(str(target))
     jar.load(ignore_discard=True, ignore_expires=True)
     assert [(c.domain, c.name, c.value) for c in jar] == [(".music.apple.com", "media-user-token", "synthetic")]
@@ -64,7 +64,7 @@ def test_import_rejects_bad_source_without_changing_previous_file(tmp_path, monk
     monkeypatch.setattr(helper, "SESSION_PATH", target)
     source = tmp_path / "bad.txt"
     source.write_text("not cookies", encoding="utf-8")
-    assert helper.import_cookie_file(str(source)) is False
+    assert helper.import_cookie_file_detailed(str(source)) is not None
     assert target.read_text(encoding="utf-8") == "previous"
 
 def test_import_writes_private_atomic_valid_cookie(tmp_path, monkeypatch):
@@ -72,7 +72,7 @@ def test_import_writes_private_atomic_valid_cookie(tmp_path, monkeypatch):
     monkeypatch.setattr(helper, "SESSION_PATH", target)
     source = tmp_path / "valid.txt"
     source.write_text("# Netscape HTTP Cookie File\n.music.apple.com\tTRUE\t/\tTRUE\t0\tmedia-user-token\tsecret\n", encoding="utf-8")
-    assert helper.import_cookie_file(str(source)) is True
+    assert helper.import_cookie_file_detailed(str(source)) is None
     assert target.read_text(encoding="utf-8").endswith("\tsecret\n")
     assert target.stat().st_mode & 0o777 == 0o600
     assert target.parent.stat().st_mode & 0o777 == 0o700
@@ -109,7 +109,7 @@ def test_import_refuses_symlinks_without_touching_previous(tmp_path, monkeypatch
         source = tmp_path / "link"
     before = target.read_bytes()
     monkeypatch.setattr(helper, "SESSION_PATH", target)
-    assert not helper.import_cookie_file(source)
+    assert helper.import_cookie_file_detailed(source) is not None
     assert target.read_bytes() == before
 
 
@@ -120,7 +120,7 @@ def test_import_rejects_writable_ancestor(tmp_path, monkeypatch):
     monkeypatch.setattr(helper, "SESSION_PATH", unsafe / "private" / "cookies.txt")
     source = tmp_path / "source"
     source.write_text(COOKIE)
-    assert not helper.import_cookie_file(source)
+    assert helper.import_cookie_file_detailed(source) is not None
     assert not helper.SESSION_PATH.exists()
 
 
@@ -158,7 +158,7 @@ def test_revoked_network_token_requires_sign_in(tmp_path, monkeypatch, status):
     source = tmp_path / "source"
     source.write_text(COOKIE)
     monkeypatch.setattr(helper, "SESSION_PATH", tmp_path / "private" / "cookies.txt")
-    assert helper.import_cookie_file(source)
+    assert helper.import_cookie_file_detailed(source) is None
     class ApiError(Exception):
         status_code = status
     monkeypatch.setattr(helper, "query_subscription", lambda _: (_ for _ in ()).throw(ApiError("synthetic")))
@@ -236,12 +236,12 @@ def test_failed_atomic_replace_preserves_previous_and_cleans_staging(tmp_path, m
     source.write_text(COOKIE)
     target = tmp_path / "private" / "cookies.txt"
     monkeypatch.setattr(helper, "SESSION_PATH", target)
-    assert helper.import_cookie_file(source)
+    assert helper.import_cookie_file_detailed(source) is None
     previous = target.read_bytes()
     def fail(*args, **kwargs):
         raise OSError("synthetic-failure")
     monkeypatch.setattr(helper.os, "replace", fail)
-    assert not helper.import_cookie_file(source)
+    assert helper.import_cookie_file_detailed(source) is not None
     assert target.read_bytes() == previous
     assert list(target.parent.iterdir()) == [target]
 
@@ -253,10 +253,10 @@ def test_file_size_limit_is_inclusive_and_rejected_import_preserves_previous(tmp
     source.write_text(payload)
     target = tmp_path / "private" / "cookies.txt"
     monkeypatch.setattr(helper, "SESSION_PATH", target)
-    assert helper.import_cookie_file(source)
+    assert helper.import_cookie_file_detailed(source) is None
     previous = target.read_bytes()
     source.write_text(payload + "#")
-    assert not helper.import_cookie_file(source)
+    assert helper.import_cookie_file_detailed(source) is not None
     assert target.read_bytes() == previous
 
 
@@ -335,7 +335,7 @@ def test_session_under_sticky_tmp_imports(monkeypatch):
         source = base / "source"
         source.write_text(COOKIE)
         monkeypatch.setattr(helper, "SESSION_PATH", base / "data" / "web-auth" / "cookies.txt")
-        assert helper.import_cookie_file(source)
+        assert helper.import_cookie_file_detailed(source) is None
         assert helper.session_present()
 
 
@@ -376,6 +376,7 @@ def test_real_browser_export_with_other_apple_hosts_imports_only_the_token(tmp_p
     (FIREFOX_EXPORT.replace("media-user-token", "other-name"), "no_music_token"),
     (FIREFOX_EXPORT.replace(".music.apple.com\tTRUE", ".apple.com\tTRUE"), "no_music_token"),
     (FIREFOX_EXPORT.replace("4102444800\tmedia-user-token", "100\tmedia-user-token"), "expired"),
+    (FIREFOX_EXPORT.replace("4102444800\tmedia-user-token", "--1\tmedia-user-token"), "not_cookie_file"),
     (FIREFOX_EXPORT + ".music.apple.com\tTRUE\t/\tTRUE\t0\tmedia-user-token\tsecond\n", "duplicate_token"),
 ])
 def test_import_reports_specific_safe_reason(tmp_path, monkeypatch, payload, reason):
@@ -383,7 +384,6 @@ def test_import_reports_specific_safe_reason(tmp_path, monkeypatch, payload, rea
     source.write_text(payload)
     monkeypatch.setattr(helper, "SESSION_PATH", tmp_path / "private" / "cookies.txt")
     assert helper.import_cookie_file_detailed(source) == reason
-    assert not helper.import_cookie_file(source)
 
 
 def test_import_reports_too_large_and_missing(tmp_path, monkeypatch):

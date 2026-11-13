@@ -129,7 +129,8 @@ check_dependencies() {
             ! python3 -c 'import sys; raise SystemExit(sys.version_info < (3, 10))' >/dev/null 2>&1; then
             missing_add 'Python 3.10+ (found an older Python)'
         fi
-        if ((basic_deps)) && { ! command -v python3 >/dev/null 2>&1 || ! python3 -m venv --help >/dev/null 2>&1; }; then
+        # Debian's python3 runs `-m venv --help` without python3-venv; only ensurepip is missing.
+        if ! command -v python3 >/dev/null 2>&1 || ! python3 -c 'import ensurepip' >/dev/null 2>&1; then
             missing_add 'Python venv support'
         fi
         command -v ffmpeg >/dev/null 2>&1 || missing_add ffmpeg
@@ -149,8 +150,7 @@ check_dependencies() {
 add_source_installer_packages() {
     if ((source_build && rust_missing)) && ! command -v curl >/dev/null 2>&1; then
         case "$package_manager" in
-            pacman|apt|dnf) packages+=(curl) ;;
-            brew) packages+=(curl) ;;
+            pacman|apt|dnf|brew) packages+=(curl) ;;
         esac
     fi
     if ((source_build)) && ! c_compiler_available; then
@@ -228,14 +228,6 @@ find_package_manager() {
         esac
     fi
 }
-remove_package() {
-    local item="$1" current
-    local remaining=()
-    for current in ${packages[@]+"${packages[@]}"}; do
-        [[ "$current" == "$item" ]] || remaining+=("$current")
-    done
-    packages=("${remaining[@]}")
-}
 replace_package() {
     local old="$1" new="$2" current
     local changed=()
@@ -252,12 +244,10 @@ package_is_needed() {
         git|jq|unzip|file|curl) ! command -v "$1" >/dev/null 2>&1 ;;
         ffmpeg|ffmpeg-free|ffprobe) ! command -v ffmpeg >/dev/null 2>&1 || \
             ! command -v ffprobe >/dev/null 2>&1 ;;
-        python) ! command -v python3 >/dev/null 2>&1 || \
-            ! python3 -c 'import sys; raise SystemExit(sys.version_info < (3, 10))' >/dev/null 2>&1 ;;
-        python3) ! command -v python3 >/dev/null 2>&1 || \
+        python|python3) ! command -v python3 >/dev/null 2>&1 || \
             ! python3 -c 'import sys; raise SystemExit(sys.version_info < (3, 10))' >/dev/null 2>&1 ;;
         python3-venv) ! command -v python3 >/dev/null 2>&1 || \
-            ! python3 -m venv --help >/dev/null 2>&1 ;;
+            ! python3 -c 'import ensurepip' >/dev/null 2>&1 ;;
         base-devel|build-essential|gcc|make) ! c_compiler_available ;;
         *) return 1 ;;
     esac
@@ -342,7 +332,7 @@ if ((dry_run)); then
     fi
     find_package_manager
     check_dependencies
-    if ((dry_run)); then filter_dry_run_packages; else filter_missing_packages; fi
+    filter_dry_run_packages
     add_source_installer_packages
     if [[ -n "$missing" ]]; then
         echo "Missing: $missing"

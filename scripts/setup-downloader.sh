@@ -50,7 +50,7 @@ if ! command -v python3 >/dev/null 2>&1 ||
     ! python3 -c 'import sys; raise SystemExit(sys.version_info < (3, 10))'; then
     die 'Python 3.10+ required; rerun with --install-deps'
 fi
-python3 -m venv --help >/dev/null || die 'Python venv support required; rerun with --install-deps'
+python3 -c 'import ensurepip' 2>/dev/null || die 'Python venv support required; rerun with --install-deps'
 for tool in ffmpeg ffprobe; do
     command -v "$tool" >/dev/null 2>&1 || die "$tool required; rerun with --install-deps"
 done

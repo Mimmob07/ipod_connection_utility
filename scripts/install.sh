@@ -183,31 +183,23 @@ if ((source_install)); then
         cargo install --path "$repo_root" --locked --root "$prefix" --force
     fi
     installed_paths+=("$prefix/bin/ipod-connection-utility")
-    install_file 0755 "$setup_script" "$prefix/bin/ipod-connection-utility-setup-backend"
     install_file 0755 "$deps_script" "$prefix/bin/ipod-connection-utility-install-dependencies"
-    install_file 0755 "$installer_script" "$prefix/bin/ipod-connection-utility-install"
-    install_file 0644 "$patch_file" "$prefix/share/ipod-connection-utility/wrapper-portable.patch"
-    install_file 0644 "$readme_file" "$prefix/share/ipod-connection-utility/README.md"
-    install_file 0644 "$downloader_file" "$prefix/share/ipod-connection-utility/DOWNLOADER_SETUP.md"
-    if [[ -f "$checker_file" ]]; then
-        install_file 0644 "$checker_file" "$prefix/share/ipod-connection-utility/check_elf_pages.py"
-    fi
 else
     "$app_source" --version >/dev/null 2>&1 || die "packaged app is not runnable on this OS/CPU: $app_source"
     install_file 0755 "$app_source" "$prefix/bin/ipod-connection-utility"
-    install_file 0755 "$setup_script" "$prefix/bin/ipod-connection-utility-setup-backend"
     if [[ -x "$deps_script" ]]; then
         install_file 0755 "$deps_script" "$prefix/bin/ipod-connection-utility-install-dependencies"
     fi
-    install_file 0755 "$installer_script" "$prefix/bin/ipod-connection-utility-install"
-    install_file 0644 "$patch_file" "$prefix/share/ipod-connection-utility/wrapper-portable.patch"
-    install_file 0644 "$readme_file" "$prefix/share/ipod-connection-utility/README.md"
-    install_file 0644 "$downloader_file" "$prefix/share/ipod-connection-utility/DOWNLOADER_SETUP.md"
-    if [[ -f "$checker_file" ]]; then
-        install_file 0644 "$checker_file" "$prefix/share/ipod-connection-utility/check_elf_pages.py"
-    fi
     "$prefix/bin/ipod-connection-utility" --version >/dev/null 2>&1 || \
         die "installed app is not runnable on this OS/CPU: $prefix/bin/ipod-connection-utility"
+fi
+install_file 0755 "$setup_script" "$prefix/bin/ipod-connection-utility-setup-backend"
+install_file 0755 "$installer_script" "$prefix/bin/ipod-connection-utility-install"
+install_file 0644 "$patch_file" "$prefix/share/ipod-connection-utility/wrapper-portable.patch"
+install_file 0644 "$readme_file" "$prefix/share/ipod-connection-utility/README.md"
+install_file 0644 "$downloader_file" "$prefix/share/ipod-connection-utility/DOWNLOADER_SETUP.md"
+if [[ -f "$checker_file" ]]; then
+    install_file 0644 "$checker_file" "$prefix/share/ipod-connection-utility/check_elf_pages.py"
 fi
 
 if [[ -f "$cleanup_script" ]]; then
@@ -255,6 +247,8 @@ if [[ -f "$manifest" && ! -L "$manifest" ]]; then
         [[ "$old" =~ ^(bin|share/ipod-connection-utility)/[^/]+$ ]] || continue
         [[ "$old" != */.. && "$old" != */. ]] || continue
         grep -qxF -- "$old" <<<"$new_manifest" && continue
+        # The alias check above found a bin/icu that is not ours: the user's file.
+        [[ "$old" == bin/icu && -z "$icu_alias" ]] && continue
         if [[ -L "$prefix/$old" || -f "$prefix/$old" ]]; then
             rm -f -- "$prefix/$old"
             echo "Removed obsolete file from the previous version: $prefix/$old"

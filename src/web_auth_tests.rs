@@ -36,6 +36,11 @@ fn probe(root: &Path, scenario: &str, python: Option<&Path>) {
     if scenario == "opener" {
         command.env("PATH", root);
     }
+    if scenario == "gamdl_python" {
+        command
+            .env_remove("IPOD_PYTHON")
+            .env("IPOD_GAMDL", root.join("bin/gamdl"));
+    }
     let output = command.output().unwrap();
     assert!(
         output.status.success(),
@@ -112,6 +117,7 @@ fn child_probe() {
             assert!(start.elapsed() < Duration::from_millis(700));
         }
         "embedded" => assert_eq!(run(&[], None).unwrap(), "{\"status\":\"error\"}"),
+        "gamdl_python" => assert_eq!(run(&[], None).unwrap(), "{\"status\":\"gamdl-venv\"}"),
         "invalid_json" => assert_eq!(check(&AtomicBool::new(false)), Err("error".into())),
         "round_trip" => {
             assert!(!has_session());
@@ -221,6 +227,17 @@ fn helper_is_embedded_in_executable() {
     .unwrap();
     fs::set_permissions(&python, fs::Permissions::from_mode(0o700)).unwrap();
     probe(&root, "embedded", Some(&python));
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn helper_uses_python_beside_configured_gamdl() {
+    let root = scratch();
+    fs::create_dir(root.join("bin")).unwrap();
+    let python = root.join("bin/python");
+    fs::write(&python, "#!/bin/sh\nprintf '{\"status\":\"gamdl-venv\"}'\n").unwrap();
+    fs::set_permissions(&python, fs::Permissions::from_mode(0o700)).unwrap();
+    probe(&root, "gamdl_python", None);
     fs::remove_dir_all(root).unwrap();
 }
 

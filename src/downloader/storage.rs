@@ -1,4 +1,5 @@
 use super::{DownloadError, STAGING_ID};
+use crate::sync::publish_new;
 use std::fs::{self, File};
 use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
@@ -98,45 +99,6 @@ pub(super) fn save_m4a(
     // A post-publication sync failure must not delete the complete published song.
     sync_directory(parent).map_err(|error| write_error(destination, error))?;
     Ok(true)
-}
-
-fn publish_new(source: &Path, destination: &Path) -> io::Result<()> {
-    #[cfg(any(target_os = "linux", target_os = "macos"))]
-    {
-        use std::ffi::CString;
-        use std::os::unix::ffi::OsStrExt;
-        let source = CString::new(source.as_os_str().as_bytes())?;
-        let destination = CString::new(destination.as_os_str().as_bytes())?;
-        // Both OS APIs provide atomic no-replace on supporting filesystems,
-        // including exFAT drivers that implement exclusive rename. Never fall
-        // back to exists()+rename(): that would clobber a racing writer.
-        #[cfg(target_os = "linux")]
-        let result = unsafe {
-            libc::renameat2(
-                libc::AT_FDCWD,
-                source.as_ptr(),
-                libc::AT_FDCWD,
-                destination.as_ptr(),
-                libc::RENAME_NOREPLACE,
-            )
-        };
-        #[cfg(target_os = "macos")]
-        let result =
-            unsafe { libc::renamex_np(source.as_ptr(), destination.as_ptr(), libc::RENAME_EXCL) };
-        if result == 0 {
-            Ok(())
-        } else {
-            Err(io::Error::last_os_error())
-        }
-    }
-    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
-    {
-        let _ = (source, destination);
-        Err(io::Error::new(
-            io::ErrorKind::Unsupported,
-            "exclusive audio publication is unsupported on this OS",
-        ))
-    }
 }
 
 fn sync_directory(directory: &Path) -> io::Result<()> {

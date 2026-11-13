@@ -10,6 +10,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver, Sender, TryRecvError};
 use std::thread;
+use std::time::{Duration, Instant};
 
 enum JobEvent {
     DownloadProgress(DownloadProgress),
@@ -244,6 +245,23 @@ impl Job {
                 Ok(JobEvent::Finished(result)) => return JobUpdate::Finished(result),
                 Err(TryRecvError::Empty) => return JobUpdate::Running,
                 Err(TryRecvError::Disconnected) => return JobUpdate::Crashed,
+            }
+        }
+    }
+}
+
+impl Job {
+    /// Cancel, then give the worker up to `timeout` to stop its child process and clean up.
+    pub fn cancel_and_wait(self, timeout: Duration) {
+        let Some(cancel) = &self.cancel else { return };
+        cancel.store(true, Ordering::Relaxed);
+        let deadline = Instant::now() + timeout;
+        while let Ok(event) = self
+            .events
+            .recv_timeout(deadline.saturating_duration_since(Instant::now()))
+        {
+            if matches!(event, JobEvent::Finished(_)) {
+                break;
             }
         }
     }

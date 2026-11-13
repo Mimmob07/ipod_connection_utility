@@ -10,6 +10,7 @@ use xxhash_rust::xxh3::Xxh3;
 mod checkpoint;
 mod copy;
 use checkpoint::Checkpoint;
+pub(crate) use copy::publish_new;
 
 pub const DATA_FILE: &str = "data.json";
 
@@ -197,7 +198,8 @@ pub fn initialize_data(
     on_progress: &mut dyn FnMut(Progress),
 ) -> io::Result<Vec<FileMetadata>> {
     let json_path = data_json_path(master_path);
-    if json_path.exists() {
+    // Fast path only; publication below is the atomic no-overwrite check.
+    if json_path.symlink_metadata().is_ok() {
         return Err(io::Error::new(
             io::ErrorKind::AlreadyExists,
             format!("{} already exists", json_path.display()),
@@ -220,20 +222,37 @@ pub fn initialize_data(
             path,
         });
     }
-    let mut file = File::create_new(json_path)?;
-    file.write_all(serde_json::to_string_pretty(&manifest)?.as_bytes())?;
+    publish_manifest(&json_path, &manifest, false)?;
     Ok(manifest)
 }
 
 pub fn read_data_json(path: &Path) -> io::Result<Vec<FileMetadata>> {
     let mut json = String::new();
-    File::open(path)?.read_to_string(&mut json)?;
+    // Keep the error kind: the TUI offers initialization on NotFound.
+    let mut file = File::open(path).map_err(|error| {
+        let hint = if error.kind() == io::ErrorKind::NotFound {
+            "; run with --initialize first"
+        } else {
+            ""
+        };
+        io::Error::new(
+            error.kind(),
+            format!("Open {}: {error}{hint}", path.display()),
+        )
+    })?;
+    file.read_to_string(&mut json)?;
     Ok(serde_json::from_str(&json)?)
 }
 
+/// Replace data.json through a synced sibling, so a crash never leaves it truncated.
 pub fn write_data_json(path: &Path, manifest: &[FileMetadata]) -> io::Result<()> {
-    let mut file = File::create(path)?;
-    file.write_all(serde_json::to_string_pretty(manifest)?.as_bytes())
+    publish_manifest(path, manifest, true)
+}
+
+fn publish_manifest(path: &Path, manifest: &[FileMetadata], replace: bool) -> io::Result<()> {
+    let json = serde_json::to_string_pretty(manifest)?;
+    copy::publish_with(path, replace, |file| file.write_all(json.as_bytes()))
+        .map_err(|error| io::Error::new(error.kind(), format!("Save {}: {error}", path.display())))
 }
 
 /// Reconcile current music on both sides. The manifest is a local metadata/hash cache;
@@ -578,6 +597,93 @@ pub(crate) mod tests {
             .collect();
         names.sort();
         names
+    }
+
+    #[test]
+    fn data_json_is_replaced_not_rewritten_in_place() {
+        let fixture = Fixture::new("data_json_replace");
+        let manifest = initialize_data(&fixture.lib(), &mut |_| {}).unwrap();
+        let path = data_json_path(&fixture.lib());
+        let old_inode = Path::new(&fixture.lib()).join("old-data.json");
+        fs::hard_link(&path, &old_inode).unwrap();
+        let before = fs::read(&old_inode).unwrap();
+        write_data_json(&path, &manifest[1..]).unwrap();
+        // In-place truncation would also change the old inode; a crash there tears data.json.
+        assert_eq!(fs::read(&old_inode).unwrap(), before);
+        assert_eq!(read_data_json(&path).unwrap().len(), manifest.len() - 1);
+        assert_eq!(stages(&fixture.lib()), Vec::<String>::new());
+    }
+
+    fn stages(dir: &str) -> Vec<String> {
+        fs::read_dir(dir)
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+            .filter(|name| name.starts_with(".ipod-sync-"))
+            .collect()
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn manifest_save_never_writes_through_a_planted_stage_symlink() {
+        let fixture = Fixture::new("data_json_symlink_stage");
+        let sentinel = fixture.root.join("sentinel");
+        fs::write(&sentinel, "keep").unwrap();
+        let lib = Path::new(&fixture.lib()).to_path_buf();
+        std::os::unix::fs::symlink(&sentinel, lib.join(".data.json.partial")).unwrap();
+        let manifest = initialize_data(&fixture.lib(), &mut |_| {}).unwrap();
+        write_data_json(&data_json_path(&fixture.lib()), &manifest).unwrap();
+        assert_eq!(fs::read(&sentinel).unwrap(), b"keep");
+        assert_eq!(
+            read_data_json(&data_json_path(&fixture.lib()))
+                .unwrap()
+                .len(),
+            5
+        );
+    }
+
+    #[test]
+    fn initialize_never_overwrites_a_manifest_created_while_hashing() {
+        let fixture = Fixture::new("data_json_init_race");
+        let path = data_json_path(&fixture.lib());
+        let other = b"[]\n";
+        let error = initialize_data(&fixture.lib(), &mut |_| {
+            // Another writer finishes after our precheck, before our publication.
+            if !path.exists() {
+                fs::write(&path, other).unwrap();
+            }
+        })
+        .unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::AlreadyExists);
+        assert_eq!(fs::read(&path).unwrap(), other);
+        assert_eq!(stages(&fixture.lib()), Vec::<String>::new());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn initialize_never_replaces_a_dangling_symlink_created_while_hashing() {
+        let fixture = Fixture::new("data_json_init_dangling");
+        let path = data_json_path(&fixture.lib());
+        let missing = fixture.root.join("missing");
+        let error = initialize_data(&fixture.lib(), &mut |_| {
+            let _ = std::os::unix::fs::symlink(&missing, &path);
+        })
+        .unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::AlreadyExists);
+        assert_eq!(fs::read_link(&path).unwrap(), missing);
+        assert!(!missing.exists());
+        assert_eq!(stages(&fixture.lib()), Vec::<String>::new());
+    }
+
+    #[test]
+    fn failed_manifest_publication_cleans_stage_and_keeps_old_data() {
+        let fixture = Fixture::new("data_json_publish_failure");
+        let path = data_json_path(&fixture.lib());
+        // A non-empty directory makes the final rename fail on Linux and macOS.
+        fs::create_dir(&path).unwrap();
+        fs::write(path.join("keep"), "untouched").unwrap();
+        assert!(write_data_json(&path, &[]).is_err());
+        assert_eq!(fs::read(path.join("keep")).unwrap(), b"untouched");
+        assert_eq!(stages(&fixture.lib()), Vec::<String>::new());
     }
 
     #[test]

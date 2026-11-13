@@ -87,7 +87,9 @@ backend_images=()
 if ((${#backend_dirs[@]})) && command -v docker >/dev/null 2>&1 && docker info >/dev/null 2>&1; then
     docker_ok=1
     while IFS= read -r image; do
-        [[ "$image" == wrapper-v2:* ]] && backend_images+=("$image")
+        # Only the app's own profile tags; never an unrelated upstream build.
+        case "$image" in wrapper-v2:native-amd64|wrapper-v2:native-arm64|wrapper-v2:asahi-16k)
+            backend_images+=("$image") ;; esac
     done < <(docker image ls --format '{{.Repository}}:{{.Tag}}' wrapper-v2 2>/dev/null || :)
 fi
 
@@ -137,7 +139,8 @@ if ((backend)); then
     fi
     for dir in ${backend_dirs[@]+"${backend_dirs[@]}"}; do
         # Stop/remove this checkout's containers and network. No -v: keep any volumes.
-        (cd "$dir" && docker compose down --remove-orphans >/dev/null 2>&1) ||
+        # The app and setup-backend.sh use this project name, not the folder name.
+        (cd "$dir" && COMPOSE_PROJECT_NAME="ipod-wrapper-${dir##*/}" docker compose down --remove-orphans >/dev/null 2>&1) ||
             die "could not remove containers for $dir; nothing further was deleted"
     done
     for image in ${backend_images[@]+"${backend_images[@]}"}; do

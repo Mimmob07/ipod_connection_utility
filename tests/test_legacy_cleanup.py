@@ -15,7 +15,7 @@ ROOT = Path(__file__).resolve().parents[1]
 CLEANUP = ROOT / 'scripts/cleanup-legacy.sh'
 
 FAKE_DOCKER = r'''#!/usr/bin/env bash
-printf 'docker %s | cwd=%s\n' "$*" "$PWD" >> "$CALLS"
+printf 'docker %s | cwd=%s%s\n' "$*" "$PWD" "${COMPOSE_PROJECT_NAME:+ project=$COMPOSE_PROJECT_NAME}" >> "$CALLS"
 [[ "${DOCKER_DOWN:-0}" == 1 ]] && exit 1
 case "$1 ${2:-}" in
   "info "*) exit 0 ;;
@@ -53,6 +53,7 @@ class Fixture(unittest.TestCase):
                         CARGO_HOME=str(self.cargo), CALLS=str(self.calls),
                         PATH=f"{self.tools}{os.pathsep}/usr/bin{os.pathsep}/bin")
         self.env.pop('IPOD_INSTALLER_HOLD', None)
+        self.env.pop('COMPOSE_PROJECT_NAME', None)
         # User data that must survive every cleanup.
         self.keep = {
             self.data / 'web-auth/cookies.txt': 'synthetic web session',
@@ -134,7 +135,7 @@ class LegacyCleanupTests(Fixture):
 
     def test_old_backend_removed_with_containers_and_images_but_sessions_kept(self):
         checkout = self.make_backend()
-        images = 'wrapper-v2:asahi-16k wrapper-v2:native-arm64'
+        images = 'wrapper-v2:asahi-16k wrapper-v2:native-arm64 wrapper-v2:latest'
         scan = self.cleanup('--scan', IMAGES=images)
         self.assertIn(f'BACKEND\t{checkout}\t', scan.stdout)
         self.assertIn('Docker image wrapper-v2:asahi-16k', scan.stdout)
@@ -142,10 +143,11 @@ class LegacyCleanupTests(Fixture):
         result = self.cleanup('--remove-old-backend', IMAGES=images)
         self.assertEqual(result.returncode, 0, result.stderr)
         calls = self.docker_calls()
-        self.assertIn(f'docker compose down --remove-orphans | cwd={checkout}', calls)
+        self.assertIn(f'docker compose down --remove-orphans | cwd={checkout} project=ipod-wrapper-asahi-16k', calls)
         self.assertIn('docker image rm wrapper-v2:asahi-16k | cwd=' + os.getcwd(), calls)
         self.assertIn('docker image rm wrapper-v2:native-arm64 | cwd=' + os.getcwd(), calls)
         joined = '\n'.join(calls)
+        self.assertNotIn('wrapper-v2:latest', scan.stdout + joined)  # a user's own upstream build
         for forbidden in (' -v', '--volumes', '--force', ' -f ', 'prune', 'system'):
             self.assertNotIn(forbidden, joined)
         self.assertFalse(checkout.exists())

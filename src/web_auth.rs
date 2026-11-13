@@ -24,24 +24,12 @@ pub fn cookies_path() -> PathBuf {
 // Ship the exact reviewed helper inside the binary, independent of source/install paths.
 const HELPER: &str = include_str!("../tools/apple_web_session.py");
 
-fn python_path() -> PathBuf {
-    if let Some(path) = std::env::var_os("IPOD_PYTHON") {
-        return path.into();
-    }
-    let sibling = crate::wrapper::user_data_dir().join("gamdl/bin/python");
-    if sibling.is_file() {
-        sibling
-    } else {
-        PathBuf::from("python3")
-    }
-}
-
 fn run(args: &[&str], cancelled: Option<&AtomicBool>) -> io::Result<String> {
     let is_cancelled = || cancelled.is_some_and(|flag| flag.load(Ordering::Relaxed));
     if is_cancelled() {
         return Err(io::Error::new(io::ErrorKind::Interrupted, "cancelled"));
     }
-    let mut command = Command::new(python_path());
+    let mut command = Command::new(crate::downloader::python_executable());
     command
         .arg("-c")
         .arg(HELPER)
@@ -279,13 +267,8 @@ pub fn forget() -> io::Result<()> {
 pub fn open_login() -> io::Result<()> {
     #[cfg(target_os = "macos")]
     let mut command = Command::new("open");
-    #[cfg(target_os = "windows")]
-    let mut command = {
-        let mut c = Command::new("cmd");
-        c.args(["/C", "start", ""]);
-        c
-    };
-    #[cfg(all(unix, not(target_os = "macos")))]
+    // Non-Unix platforms cannot import or check sessions (see run), so they get no opener.
+    #[cfg(not(target_os = "macos"))]
     let mut command = Command::new("xdg-open");
     let mut child = command
         .arg("https://music.apple.com")

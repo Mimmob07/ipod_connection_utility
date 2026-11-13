@@ -37,7 +37,7 @@ fn web_aac_invocation_uses_cookie_file_without_wrapper_flags() {
         );
         return;
     }
-    let cookies = web_cookies_path();
+    let cookies = crate::web_auth::cookies_path();
     fs::create_dir_all(cookies.parent().unwrap()).unwrap();
     fs::write(&cookies, "# Netscape HTTP Cookie File\n.music.apple.com\tTRUE\t/\tTRUE\t0\tmedia-user-token\tsynthetic-session-for-test\n").unwrap();
     let fixture = Fixture::new("web_args_download");
